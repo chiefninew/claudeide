@@ -54,13 +54,24 @@ function showWindowsToast(title, body) {
 // returned as their paths; a raw bitmap is saved to %TEMP% and that path is
 // returned. Output is one Windows path per line, or 'NONE'. STA is required for
 // the clipboard APIs.
+// Note the retry wrapper: WinForms' Clipboard.GetImage/GetFileDropList throw
+// ("Requested Clipboard operation did not succeed") when another process holds
+// the clipboard open for a moment — which is why a paste "sometimes" worked and
+// sometimes reported nothing. Retry-with-backoff makes each read reliable, and a
+// per-read try/catch means a transient lock never nukes the whole result.
 const CLIP_PS = [
   "$ErrorActionPreference='Stop'",
   'Add-Type -AssemblyName System.Windows.Forms',
   'Add-Type -AssemblyName System.Drawing',
-  '$f=[System.Windows.Forms.Clipboard]::GetFileDropList()',
+  'function Read-Clip($fn){',
+  '  for($i=0;$i -lt 10;$i++){',
+  '    try{ return (& $fn) } catch { Start-Sleep -Milliseconds 40 }',
+  '  }',
+  '  return $null',
+  '}',
+  '$f=Read-Clip { [System.Windows.Forms.Clipboard]::GetFileDropList() }',
   'if($f -and $f.Count -gt 0){ foreach($i in $f){ [Console]::Out.WriteLine($i) }; exit 0 }',
-  '$img=[System.Windows.Forms.Clipboard]::GetImage()',
+  '$img=Read-Clip { [System.Windows.Forms.Clipboard]::GetImage() }',
   'if($img -ne $null){',
   "  $name='claudeide_clip_'+(Get-Date -Format 'yyyyMMdd_HHmmssfff')+'.png'",
   '  $p=Join-Path $env:TEMP $name',

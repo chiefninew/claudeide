@@ -816,6 +816,10 @@ body.zen #statusbar { display: none; }   /* chrome melts away in focus mode */
 #toolbar, .group-tabbar {
   transition: max-height .22s ease, opacity .2s ease, padding .22s ease;
 }
+/* While dragging the title bar, kill that transition so a stray reflow can't
+   animate the header slowly expanding toward its max-height. */
+body.win-dragging #toolbar,
+body.win-dragging .group-tabbar { transition: none; }
 body.zen #toolbar,
 body.zen .group-tabbar {
   max-height: 0;

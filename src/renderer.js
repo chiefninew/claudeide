@@ -451,7 +451,7 @@ function createPane(opts = {}) {
       <span class="pane-state-label state-dead">init</span>
       <span class="pane-status"></span>
       <button class="pane-btn explorer" title="Open File Explorer for this folder (F4)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
-      <button class="pane-btn paste-path" title="Insert file/image path from the Windows clipboard (Ctrl+Shift+V)">ℹ</button>
+      <button class="pane-btn paste-path" title="Smart paste from the Windows clipboard: a file/image becomes its path, otherwise text (Ctrl+Shift+V)">ℹ</button>
       <button class="pane-btn restart" title="Restart command">↻</button>
       <button class="pane-btn close" title="Close pane">✕</button>
     </div>
@@ -621,7 +621,7 @@ function createPane(opts = {}) {
   el.querySelector('.paste-path').addEventListener('click', (e) => {
     e.stopPropagation();
     focusPane(p);
-    insertClipboardPath(p);
+    smartPaste(p);   // same behaviour as Ctrl+Shift+V: path for a file/image, else text
   });
   el.querySelector('.explorer').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -2553,19 +2553,6 @@ function legacyCopy(text) {
   });
 }
 
-function insertClipboardPath(target) {
-  if (!window.hydra.grabClipboard) return;
-  const p = target || panes.get(focusedId);
-  if (!p) return;
-  window.hydra.grabClipboard().then((raws) => {
-    if (!raws || !raws.length) { flash('No file or image on the Windows clipboard'); return; }
-    const quoted = raws.map((r) => shellQuotePath(toLocalPath(r))).filter(Boolean).join(' ');
-    if (!quoted) { flash('Could not resolve the clipboard path'); return; }
-    window.hydra.input(p.id, quoted);
-    focusPane(p);
-  }).catch(() => flash('Could not read the Windows clipboard'));
-}
-
 // Ctrl+Shift+V smart paste: a file/image on the Windows clipboard becomes its
 // shell-quoted path (grabWindowsClipboard returns only files/images, never text),
 // otherwise fall back to pasting the clipboard's plain text. Symmetric counterpart
@@ -2848,6 +2835,7 @@ document.getElementById('win-close').addEventListener('click', () => window.hydr
   const endDrag = () => {
     if (!dragging) return;
     dragging = false;
+    document.body.classList.remove('win-dragging');
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
     pending = null;
     window.hydra.dragEnd();
@@ -2861,6 +2849,9 @@ document.getElementById('win-close').addEventListener('click', () => window.hydr
       return;
     }
     dragging = true;
+    // Freeze the toolbar's zen-collapse transition so any layout jitter WSLg
+    // fires while the window moves can't animate the header expanding.
+    document.body.classList.add('win-dragging');
     window.hydra.dragStart(e.screenX, e.screenY);
     e.preventDefault();                  // don't start a text selection
   });
