@@ -1725,6 +1725,7 @@ function showSettingsMenu(anchor) {
 // Release history, newest first — surfaced in the About dialog so users can see
 // what shipped when. Keep this in step with the "Release vX" commits.
 const RELEASES = [
+  ['0.5.16', 'SSH connections can pick their client: WSL ssh or PowerShell ssh'],
   ['0.5.15', 'File/Edit/View/Help menu bar + About dialog + Settings under File'],
   ['0.5.14', 'Smart paste text fallback + reliable Windows clipboard bridge'],
   ['0.5.13', 'Footer shortcut hints + faster terminal scroll'],
@@ -2306,6 +2307,7 @@ function askWorkspace(title, initial = {}) {
           <div class="conn-options"></div>
           <select class="modal-input ws-distro" style="display:none; margin-top:6px;"></select>
           <input class="modal-input ws-ssh" type="text" spellcheck="false" placeholder="user@hostname" style="display:none; margin-top:6px;" />
+          <select class="modal-input ws-sshvia" style="display:none; margin-top:6px;"></select>
           <div class="ws-status" style="display:none;"></div>
           <div class="modal-actions">
             <button class="modal-cancel">Cancel</button>
@@ -2336,6 +2338,7 @@ function askWorkspace(title, initial = {}) {
     const nameEl = overlay.querySelector('.ws-name');
     const dirEl = overlay.querySelector('.ws-dir');
     const sshEl = overlay.querySelector('.ws-ssh');
+    const sshViaEl = overlay.querySelector('.ws-sshvia');
     const distroEl = overlay.querySelector('.ws-distro');
     const optsEl = overlay.querySelector('.conn-options');
     const statusEl = overlay.querySelector('.ws-status');
@@ -2349,6 +2352,28 @@ function askWorkspace(title, initial = {}) {
     const init = (initial.target && initial.target.kind) ? initial.target : defaultRemote();
     let sel = init.kind;
     sshEl.value = init.kind === 'ssh' ? (init.host || '') : '';
+
+    // Which ssh client to run the connection with. Both exist only when a
+    // Windows side is reachable (native Windows, or WSL via interop) — on a
+    // plain Linux/Mac host there's no choice to offer, so the picker stays
+    // hidden and the target carries no sshVia.
+    const hasSshViaPicker = env.isWin || env.isWsl;
+    if (hasSshViaPicker) {
+      const viaChoices = [
+        { value: 'wsl', label: 'Use WSL ssh (Linux keys & config)' },
+        { value: 'powershell', label: 'Use PowerShell ssh (Windows keys & config)' },
+      ];
+      for (const v of viaChoices) {
+        const o = document.createElement('option');
+        o.value = v.value;
+        o.textContent = v.label;
+        sshViaEl.appendChild(o);
+      }
+      // Saved choice first, else the host's native client (the old behavior).
+      const initVia = (init.kind === 'ssh' && (init.sshVia === 'wsl' || init.sshVia === 'powershell'))
+        ? init.sshVia : (env.isWin ? 'powershell' : 'wsl');
+      sshViaEl.value = initVia;
+    }
     const choices = [];
     if (env.isWin) {
       // Native Windows install: WSL (where Claude Code lives) + PowerShell.
@@ -2394,6 +2419,7 @@ function askWorkspace(title, initial = {}) {
     // Show the SSH host / WSL distro input that matches the selected connection.
     function syncExtras() {
       sshEl.style.display = sel === 'ssh' ? '' : 'none';
+      sshViaEl.style.display = (sel === 'ssh' && hasSshViaPicker) ? '' : 'none';
       distroEl.style.display = (sel === 'wsl' && hasDistroPicker()) ? '' : 'none';
     }
 
@@ -2438,7 +2464,7 @@ function askWorkspace(title, initial = {}) {
       const c = choiceOf(sel);
       summaryEl.innerHTML = c.icon + `<span class="ws-conn-summary-text"></span>`;
       summaryEl.querySelector('.ws-conn-summary-text').textContent =
-        sel === 'ssh' ? `SSH · ${committed.host}`
+        sel === 'ssh' ? `SSH · ${committed.host}${committed.sshVia === 'powershell' ? ' · PowerShell' : committed.sshVia === 'wsl' ? ' · WSL' : ''}`
         : (sel === 'wsl' && committed.distro) ? `WSL · ${committed.distro}`
         : `${c.name} · ${c.sub}`;
       dirEl.focus();
@@ -2454,6 +2480,7 @@ function askWorkspace(title, initial = {}) {
       const host = (sshEl.value || '').trim();
       if (sel === 'ssh' && !host) { sshEl.focus(); setStatus('Enter an SSH host (user@hostname).', 'error'); return; }
       const target = { kind: sel, host: sel === 'ssh' ? host : '' };
+      if (sel === 'ssh' && hasSshViaPicker) target.sshVia = sshViaEl.value || '';
       if (sel === 'wsl' && hasDistroPicker()) target.distro = distroEl.value || '';
 
       // Verify the ones that actually reach off this process: ssh always, and
@@ -2600,7 +2627,12 @@ function defaultRemote() { return { kind: 'wsl', host: '' }; }
 
 function remoteLabel(r) {
   if (!r) return 'Local';
-  if (r.kind === 'ssh') return `SSH: ${r.host || '?'}`;
+  if (r.kind === 'ssh') {
+    // Flag the ssh client only when it's not the host's native one.
+    const via = r.sshVia === 'powershell' && !env.isWin ? ' (PowerShell)'
+      : r.sshVia === 'wsl' && env.isWin ? ' (WSL)' : '';
+    return `SSH: ${r.host || '?'}${via}`;
+  }
   if (r.kind === 'local') return env.isWin ? 'PowerShell' : 'Local (Windows)';
   // 'wsl' kind: a WSL distro on a WSL/Windows host, else the plain local shell.
   if (env.isWsl) return `WSL: ${env.distro || 'Linux'}`;
@@ -3173,8 +3205,7 @@ function updateSummary() {
   summaryEl.innerHTML =
     `<span class="st-item">${a.total} pane${a.total !== 1 ? 's' : ''}</span>` +
     statusSeg('busy', a.working, 'working') +
-    statusSeg('approval', a.approval, 'need you') +
-    statusSeg('approval', a.awaiting, 'your turn') +
+    statusSeg('approval', a.approval + a.awaiting, 'your turn') +
     statusSeg('ready', a.ready, 'ready') +
     statusSeg('error', a.error, 'error') +
     statusSeg('dead', a.dead, 'exited');

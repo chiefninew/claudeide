@@ -155,6 +155,22 @@ function normalizeCwd(input) {
   return s;
 }
 
+// Which ssh client an ssh target uses. `via` comes from the workspace wizard:
+//   powershell - Windows OpenSSH (ssh.exe, the client PowerShell runs) with the
+//                Windows-side ~/.ssh keys/config; reached over interop when the
+//                host is WSL
+//   wsl        - the Linux client (and Linux-side keys/config); wrapped in
+//                wsl.exe when the host is native Windows
+// Unset (older saves) falls back to the host's native client, matching the old
+// behavior. `pre` holds wrapper args that must precede the real ssh args;
+// --exec execs ssh directly so the distro's login shell can't re-expand them.
+function sshClientSpec(via) {
+  const useWin = via === 'powershell' ? true : via === 'wsl' ? false : IS_WIN;
+  if (useWin) return { file: 'ssh.exe', pre: [] };
+  if (IS_WIN) return { file: 'wsl.exe', pre: ['--exec', 'ssh'] };
+  return { file: 'ssh', pre: [] };
+}
+
 // Decide what to actually launch for a pane based on the selected remote target
 // (the VSCode-style indicator). Returns the node-pty spawn spec. Targets:
 //   wsl   - the WSL distro (the default; where Claude Code lives)
@@ -171,7 +187,8 @@ function resolveTarget(target, cwd) {
       ? cwd.trim() : winHome;                       // only an existing native path is a valid launch dir
 
     if (kind === 'ssh' && target.host) {
-      return { file: 'ssh.exe', args: ['-t', target.host], cwd: winCwd, env: { ...process.env, TERM: 'xterm-256color' }, warning: null };
+      const c = sshClientSpec(target.sshVia);
+      return { file: c.file, args: [...c.pre, '-t', target.host], cwd: winCwd, env: { ...process.env, TERM: 'xterm-256color' }, warning: null };
     }
     if (kind === 'local') {
       return { file: 'powershell.exe', args: ['-NoLogo'], cwd: winCwd, env: { ...process.env }, warning: null };
@@ -193,8 +210,9 @@ function resolveTarget(target, cwd) {
   const home = os.homedir();
 
   if (kind === 'ssh' && target.host) {
+    const c = sshClientSpec(target.sshVia);      // 'powershell' -> ssh.exe over interop
     return {
-      file: 'ssh', args: ['-t', target.host],
+      file: c.file, args: [...c.pre, '-t', target.host],
       cwd: exists ? want : home,                 // local launch dir; remote ignores it
       env: { ...process.env, TERM: 'xterm-256color' },
       warning: null,
@@ -252,8 +270,9 @@ function posixParent(p) {
 // wsl.exe / ssh and parses its output into the same shape the native lister
 // returns ({ path, parent, entries }), or null if it couldn't be reached.
 // `hostOrDistro` is the ssh host (mode 'ssh') or the WSL distro name (mode
-// 'wsl'); empty for wsl means the default distro.
-function listDirViaShell(mode, hostOrDistro, startDir) {
+// 'wsl'); empty for wsl means the default distro. `via` picks the ssh client
+// (see sshClientSpec).
+function listDirViaShell(mode, hostOrDistro, startDir, via) {
   return new Promise((resolve) => {
     const dir = (startDir == null ? '' : String(startDir)).replace(/'/g, `'\\''`);
     // cd into the requested dir (or $HOME when empty/gone), print the resolved
@@ -265,10 +284,11 @@ function listDirViaShell(mode, hostOrDistro, startDir) {
 
     let file, args, opts = { timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 };
     if (mode === 'ssh') {
-      file = IS_WIN ? 'ssh.exe' : 'ssh';
+      const c = sshClientSpec(via);
+      file = c.file;
       // Single remote-command arg: ssh hands it to the login shell verbatim.
       // BatchMode/ConnectTimeout keep a bad host from hanging on a prompt.
-      args = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6', hostOrDistro, script];
+      args = [...c.pre, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6', hostOrDistro, script];
     } else { // 'wsl' — a specific distro (or the default when none given)
       file = 'wsl.exe';
       // --exec runs sh directly instead of through the distro's login shell.
@@ -307,11 +327,12 @@ function shQuote(s) { return `'${String(s == null ? '' : s).replace(/'/g, `'\\''
 
 // Build the spawn spec ([file, args] + env) to run a POSIX `script` on a
 // connection: an ssh host, or a WSL distro (only meaningful on a Windows host).
-function connShellSpec(mode, hostOrDistro, script) {
+function connShellSpec(mode, hostOrDistro, script, via) {
   if (mode === 'ssh') {
+    const c = sshClientSpec(via);
     return {
-      file: IS_WIN ? 'ssh.exe' : 'ssh',
-      args: ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6', hostOrDistro, script],
+      file: c.file,
+      args: [...c.pre, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6', hostOrDistro, script],
       env: { ...process.env },
     };
   }
@@ -331,7 +352,7 @@ function connShellSpec(mode, hostOrDistro, script) {
 // 'local' is the host fs).
 function explorerConn(target) {
   const kind = target && target.kind;
-  if (kind === 'ssh' && target.host) return { mode: 'ssh', hostOrDistro: target.host };
+  if (kind === 'ssh' && target.host) return { mode: 'ssh', hostOrDistro: target.host, via: target.sshVia || '' };
   if (kind === 'wsl' && IS_WIN) return { mode: 'wsl', hostOrDistro: (target && target.distro) || '' };
   return null;
 }
@@ -343,7 +364,7 @@ const STRIP_NUL = new RegExp(String.fromCharCode(0), 'g');
 
 // List a directory on a connection: resolved path + sorted dirs and files.
 // Each entry line is tagged `d <name>` / `f <name>` so spaces in names survive.
-function listDirFullViaShell(mode, hostOrDistro, startDir) {
+function listDirFullViaShell(mode, hostOrDistro, startDir, via) {
   return new Promise((resolve) => {
     const dir = (startDir == null ? '' : String(startDir)).replace(/'/g, `'\\''`);
     const script =
@@ -351,7 +372,7 @@ function listDirFullViaShell(mode, hostOrDistro, startDir) {
       `pwd; ` +
       `for e in * .*; do case "$e" in .|..|'*') continue;; esac; ` +
       `if [ -d "$e" ]; then printf 'd %s\\n' "$e"; elif [ -e "$e" ]; then printf 'f %s\\n' "$e"; fi; done`;
-    const { file, args, env } = connShellSpec(mode, hostOrDistro, script);
+    const { file, args, env } = connShellSpec(mode, hostOrDistro, script, via);
     execFile(file, args, { timeout: 8000, windowsHide: true, maxBuffer: 16 * 1024 * 1024, env }, (_err, stdout) => {
       const raw = String(stdout || "").replace(STRIP_NUL, "").replace(/\r/g, "").split("\n");
       const i = raw.findIndex((l) => l.startsWith("/"));    // pwd is the first absolute line
@@ -371,13 +392,13 @@ function listDirFullViaShell(mode, hostOrDistro, startDir) {
 
 // Read a text file on a connection. Guards against directories, missing files,
 // oversized files (maxBuffer), and binary content (NUL byte).
-function readFileViaShell(mode, hostOrDistro, filePath, maxRead) {
+function readFileViaShell(mode, hostOrDistro, filePath, maxRead, via) {
   return new Promise((resolve) => {
     const q = shQuote(filePath);
     const script =
       `f=${q}; if [ ! -e "$f" ]; then echo __HX_NOENT__ >&2; exit 2; fi; ` +
       `if [ -d "$f" ]; then echo __HX_ISDIR__ >&2; exit 3; fi; cat -- "$f"`;
-    const { file, args, env } = connShellSpec(mode, hostOrDistro, script);
+    const { file, args, env } = connShellSpec(mode, hostOrDistro, script, via);
     execFile(file, args,
       { timeout: 15000, windowsHide: true, maxBuffer: maxRead + 4096, encoding: 'buffer', env },
       (err, stdout, stderr) => {
@@ -398,9 +419,9 @@ function readFileViaShell(mode, hostOrDistro, filePath, maxRead) {
 
 // Write a text file on a connection by piping the content to `cat > file`.
 // stdin carries the bytes so no content quoting is needed (only the path).
-function writeFileViaShell(mode, hostOrDistro, filePath, content) {
+function writeFileViaShell(mode, hostOrDistro, filePath, content, via) {
   return new Promise((resolve) => {
-    const { file, args, env } = connShellSpec(mode, hostOrDistro, `cat > ${shQuote(filePath)}`);
+    const { file, args, env } = connShellSpec(mode, hostOrDistro, `cat > ${shQuote(filePath)}`, via);
     let child;
     try {
       child = spawn(file, args, { windowsHide: true, env, timeout: 15000, stdio: ['pipe', 'ignore', 'pipe'] });
@@ -571,7 +592,7 @@ function registerIpc() {
     const { path: dirPath, target } = fsArg(arg);
     const conn = explorerConn(target);
     if (conn) {
-      const r = await listDirFullViaShell(conn.mode, conn.hostOrDistro, dirPath);
+      const r = await listDirFullViaShell(conn.mode, conn.hostOrDistro, dirPath, conn.via);
       return r || { path: (dirPath && String(dirPath).trim()) || '~', parent: null, dirs: [], files: [], unreachable: true };
     }
 
@@ -603,7 +624,7 @@ function registerIpc() {
   ipcMain.handle('fs:read', async (_e, arg) => {
     const { path: filePath, target } = fsArg(arg);
     const conn = explorerConn(target);
-    if (conn) return await readFileViaShell(conn.mode, conn.hostOrDistro, filePath, MAX_READ);
+    if (conn) return await readFileViaShell(conn.mode, conn.hostOrDistro, filePath, MAX_READ, conn.via);
     try {
       const p = normalizeCwd(filePath);
       const st = fs.statSync(p);
@@ -618,7 +639,7 @@ function registerIpc() {
   // Write a text file back from the Explorer editor (Ctrl+S).
   ipcMain.handle('fs:write', async (_e, { path: filePath, content, target } = {}) => {
     const conn = explorerConn(target);
-    if (conn) return await writeFileViaShell(conn.mode, conn.hostOrDistro, filePath, content);
+    if (conn) return await writeFileViaShell(conn.mode, conn.hostOrDistro, filePath, content, conn.via);
     try {
       fs.writeFileSync(normalizeCwd(filePath), content == null ? '' : String(content), 'utf8');
       return { ok: true };
@@ -797,9 +818,9 @@ function registerIpc() {
     if (kind !== 'ssh') return { ok: true };
     if (!host) return { ok: false, error: 'No SSH host given' };
     return await new Promise((resolve) => {
-      const file = IS_WIN ? 'ssh.exe' : 'ssh';
-      execFile(file,
-        ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new', host, 'true'],
+      const c = sshClientSpec(target && target.sshVia);
+      execFile(c.file,
+        [...c.pre, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new', host, 'true'],
         { timeout: 14000, windowsHide: true },
         (err, _out, stderr) => {
           if (!err) { resolve({ ok: true }); return; }
@@ -833,7 +854,7 @@ function registerIpc() {
     // A native WSL/Linux host already IS the wsl filesystem, and `local` on
     // Windows is the host fs, so both fall through to the native lister below.
     if (kind === 'ssh' && host) {
-      const r = await listDirViaShell('ssh', host, startPath);
+      const r = await listDirViaShell('ssh', host, startPath, payload.target.sshVia);
       // Never fall back to the local fs for ssh — showing host folders as if
       // they were the remote's is worse than an honest empty listing.
       return r || { path: (startPath && String(startPath).trim()) || '~', parent: null, entries: [], unreachable: true };
