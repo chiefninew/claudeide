@@ -35,6 +35,11 @@
     // as "idle" when there's no live working signal — detect() enforces that by
     // giving the spinner / interrupt a hard priority over this.
     shortcuts: /(\?\s*for shortcuts|←\s*for agents|[⏵▶]{2}\s*(?:accept edits|auto[- ]?accept|auto mode)|auto[- ]?accept edits on|bypass permissions on)/i,
+    // The GENUINELY idle-only footer: the input box hint shown when Claude is
+    // waiting on you. Unlike `shortcuts` above it excludes the mode footers (which
+    // persist while working), so its position marks where the live input box is.
+    // Used to reject a stale/static spinner glyph that sits ABOVE the input box.
+    idleFooter: /(\?\s*for shortcuts|←\s*for agents)/i,
     // "● Bash(npm test)"  /  "● Update(src/foo.ts)"
     tool: /●\s*([A-Z][A-Za-z]+)\(([^)]*)\)/,
     // any assistant action bullet
@@ -111,10 +116,17 @@
     const iApproval = lastIndex(lines, RE.approval);
     const iSpinner = lastIndex(lines, RE.spinner);
     const iInterrupt = lastIndex(lines, RE.interrupt);
-    const iWorking = Math.max(iSpinner, iInterrupt);
     const iIdle = lastIndex(lines, RE.shortcuts);
+    const iIdleFooter = lastIndex(lines, RE.idleFooter);
+    // A bare spinner glyph is NOT proof of work: Claude paints the same glyphs in
+    // its static UI ("✳ Welcome to Claude Code", "✻ Tip: …"). So a spinner only
+    // counts as live when it sits BELOW the idle input box — otherwise it's stale
+    // scrollback / a banner above a settled prompt, and the pane is really idle.
+    // "esc to interrupt" is unambiguous and needs no such guard.
+    const spinnerLive = iSpinner >= 0 && iSpinner > iIdleFooter;
+    const iWorking = Math.max(spinnerLive ? iSpinner : -1, iInterrupt);
     // elapsed/tokens read best off the spinner line itself when there is one.
-    const meta = collectMeta(lines, iSpinner >= 0 ? iSpinner : iInterrupt);
+    const meta = collectMeta(lines, spinnerLive ? iSpinner : iInterrupt);
 
     // WORKING WINS. An active spinner or an "esc to interrupt" hint means Claude
     // is processing right NOW, and that must outrank everything below it — the
@@ -122,7 +134,7 @@
     // both working and idle states, so a "lowest signal wins" race would let it
     // masquerade as idle whenever "esc to interrupt" is clipped off a narrow pane.
     if (iWorking >= 0) {
-      const spin = iSpinner >= 0 ? lines[iSpinner].match(RE.spinner) : null;
+      const spin = spinnerLive ? lines[iSpinner].match(RE.spinner) : null;
       const vm = spin || lines[iWorking].match(RE.verb);
       const verb = vm ? vm[1] : null;
       const detail = meta.tool || (verb ? verb + '…' : lastBullet(lines)) || 'working…';

@@ -41,6 +41,18 @@ const STATE_UI = {
   init:     { dot: 'dead',     css: 'dead' },
 };
 
+// Placeholder for the pane sub-header when the detector has no activity detail
+// for a state — keeps the "what's Claude doing" line from ever going blank.
+const ACTIVITY_FALLBACK = {
+  working:  'working…',
+  approval: 'needs your input',
+  input:    'awaiting instruction',
+  ready:    'idle',
+  error:    'error',
+  dead:     'process exited',
+  init:     'starting…',
+};
+
 // Terminal (xterm) palettes per color theme. The window chrome is driven by CSS
 // variables (styles.css); these keep each terminal's colors in step with it.
 const XTERM_THEMES = {
@@ -102,6 +114,59 @@ const THEMES = [
 
 let themeId = 'dark';   // current color theme; persisted on the store
 function xtermTheme(id) { return XTERM_THEMES[id] || XTERM_THEMES.dark; }
+
+// ---- custom theme model ----------------------------------------------------
+// The chrome is painted entirely from CSS variables, so a user theme is just a
+// map of those variables (grouped here for the Theme Studio editor) plus a
+// terminal palette. A saved custom theme is applied as inline var overrides on
+// <html> (see applyInlineThemeVars) and registered into XTERM_THEMES as 'custom'.
+const THEME_VAR_GROUPS = [
+  { title: 'Surfaces', vars: [
+    ['--bg', 'Editor / terminal'], ['--panel', 'Side bar / tabs'],
+    ['--panel-2', 'Inactive tab / hover'], ['--titlebar', 'Title bar'], ['--input', 'Inputs'] ] },
+  { title: 'Lines', vars: [
+    ['--border', 'Dividers'], ['--border-2', 'Control borders'], ['--contrast', 'Active outline'] ] },
+  { title: 'Text', vars: [
+    ['--text', 'Primary'], ['--muted', 'Muted'], ['--bright', 'Bright / hover'] ] },
+  { title: 'Accent & actions', vars: [
+    ['--accent', 'Accent'], ['--focus', 'Focus ring'], ['--btn', 'Button'], ['--btn-hover', 'Button hover'],
+    ['--btn-primary', 'Primary button'], ['--btn-primary-hover', 'Primary hover'],
+    ['--remote', 'Remote badge'], ['--remote-hover', 'Remote hover'] ] },
+  { title: 'Overlays', vars: [
+    ['--hover', 'Hover wash'], ['--hover-strong', 'Strong hover'], ['--inset', 'Inset chip'],
+    ['--attn-head', 'Attention header'], ['--row-active', 'Selected row'] ] },
+  { title: 'Agent status', vars: [
+    ['--busy', 'Running'], ['--ready', 'Idle / done'], ['--waiting', 'Waiting'],
+    ['--attn', 'Needs you'], ['--error', 'Failed'], ['--dead', 'Exited'] ] },
+];
+const THEME_VARS = THEME_VAR_GROUPS.flatMap((g) => g.vars.map((v) => v[0]));
+const TERM_KEYS = [
+  ['background', 'Background'], ['foreground', 'Foreground'], ['cursor', 'Cursor'], ['selectionBackground', 'Selection'],
+  ['black', 'Black'], ['red', 'Red'], ['green', 'Green'], ['yellow', 'Yellow'],
+  ['blue', 'Blue'], ['magenta', 'Magenta'], ['cyan', 'Cyan'], ['white', 'White'],
+  ['brightBlack', 'Bright Black'], ['brightRed', 'Bright Red'], ['brightGreen', 'Bright Green'], ['brightYellow', 'Bright Yellow'],
+  ['brightBlue', 'Bright Blue'], ['brightMagenta', 'Bright Magenta'], ['brightCyan', 'Bright Cyan'], ['brightWhite', 'Bright White'],
+];
+
+// Snapshot the currently-applied theme (resolved chrome vars + terminal palette)
+// into an editable model. Works from any base theme since it reads computed CSS.
+function snapshotThemeModel() {
+  const cs = getComputedStyle(document.documentElement);
+  const vars = {};
+  for (const v of THEME_VARS) vars[v] = cs.getPropertyValue(v).trim();
+  const t = xtermTheme(themeId);
+  const term = {};
+  for (const [k] of TERM_KEYS) term[k] = t[k] || '#000000';
+  return { vars, term };
+}
+
+// Paint the chrome from a custom model's inline var overrides — or clear them for
+// built-in themes, which are painted by their :root[data-theme] block in CSS.
+function applyInlineThemeVars(model) {
+  const s = document.documentElement.style;
+  for (const v of THEME_VARS) s.removeProperty(v);
+  if (model && model.vars) for (const v of THEME_VARS) if (model.vars[v]) s.setProperty(v, model.vars[v]);
+}
 
 // Read the bottom `maxRows` lines of the composited xterm screen as plain text.
 // We read the rendered buffer (not the raw stream) so the TUI's in-place
@@ -449,11 +514,19 @@ function createPane(opts = {}) {
       <span class="dot dead"></span>
       <span class="pane-title" contenteditable="true" spellcheck="false" draggable="false"></span>
       <span class="pane-state-label state-dead">init</span>
-      <span class="pane-status"></span>
+      <span class="head-spacer"></span>
       <button class="pane-btn explorer" title="Open File Explorer for this folder (F4)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
       <button class="pane-btn paste-path" title="Smart paste from the Windows clipboard: a file/image becomes its path, otherwise text (Ctrl+Shift+V)">ℹ</button>
       <button class="pane-btn restart" title="Restart command">↻</button>
       <button class="pane-btn close" title="Close pane">✕</button>
+    </div>
+    <!-- Sub-header: a dedicated full-width line focused on what Claude Code is
+         doing right now (the detector's activity detail), tinted by state, with
+         compact meta (elapsed · tokens · context) on the right. -->
+    <div class="pane-subhead">
+      <span class="subhead-ico" aria-hidden="true"></span>
+      <span class="pane-activity"></span>
+      <span class="pane-meta"></span>
     </div>
     <div class="pane-body"></div>`;
   // Park the pane in its group's grid (falls back to the first group's grid).
@@ -496,7 +569,9 @@ function createPane(opts = {}) {
     id, el, term, fit, serialize,
     dot: el.querySelector('.dot'),
     stateLabel: el.querySelector('.pane-state-label'),
-    status: el.querySelector('.pane-status'),
+    subhead: el.querySelector('.pane-subhead'),
+    activity: el.querySelector('.pane-activity'),
+    metaEl: el.querySelector('.pane-meta'),
     title: el.querySelector('.pane-title'),
     git: null,        // last-seen { branch, repo, detached } or null
     lastData: 0,
@@ -920,7 +995,7 @@ function normalizeStore(s) {
     }
     s.groups = s.groups.filter((g) => g.open.length);
     s.recents = s.recents || {};
-    if (!s.groups.length) return { ...freshStore(), recents: s.recents, theme: s.theme, zoom: s.zoom };
+    if (!s.groups.length) return { ...freshStore(), recents: s.recents, theme: s.theme, zoom: s.zoom, customTheme: s.customTheme };
     for (const g of s.groups) {
       if (!g.open.includes(g.active)) g.active = g.open[0];
       if (!g.flex) g.flex = 1;
@@ -950,7 +1025,7 @@ function normalizeToV4(s) {
     s.open = s.open.filter((id) => s.tabs[id]);
     // No open tabs → welcome screen, but KEEP the saved-workspace registry and
     // prefs (so closing the last tab, or a blank New Window, still lists them).
-    if (!s.open.length) return { ...freshStore(), recents: s.recents || {}, theme: s.theme, zoom: s.zoom };
+    if (!s.open.length) return { ...freshStore(), recents: s.recents || {}, theme: s.theme, zoom: s.zoom, customTheme: s.customTheme };
     if (!s.tabs[s.active]) s.active = s.open[0];
     s.recents = s.recents || {};
     for (const id of s.open) {                               // open tabs are always reopenable
@@ -1460,33 +1535,114 @@ function showWorkspaceMenu(anchor) {
   }, 0);
 }
 
-// ---- File menu (title-bar dropdown) ----------------------------------------
-let fileMenuEl = null;
-function closeFileMenu() {
-  if (fileMenuEl) { fileMenuEl.remove(); fileMenuEl = null; }
-  const btn = document.getElementById('file-menu');
-  if (btn) btn.classList.remove('open');
-  document.removeEventListener('mousedown', onFileMenuOutside, true);
-  document.removeEventListener('keydown', onFileMenuKey, true);
-}
-function onFileMenuOutside(e) {
-  if (fileMenuEl && !fileMenuEl.contains(e.target) && !e.target.closest('#file-menu')) closeFileMenu();
-}
-function onFileMenuKey(e) { if (e.key === 'Escape') { e.preventDefault(); closeFileMenu(); } }
+// ---- Title-bar menu bar (File / Edit / View / Help) ------------------------
+// One generic dropdown engine drives all four menus. A menu is described as an
+// items[] spec ({label,hint,run,keepOpen,disabled} or {label,submenu:[…]} for a
+// flyout, or {sep:true}). Only one bar menu is open at a time; hovering another
+// top-level button while one is open switches to it (VSCode behaviour).
+let barMenuEl = null;      // the open dropdown, if any
+let barMenuBtn = null;     // its anchoring .menu-btn
+let flyoutEl = null;       // the open right-hand flyout, if any
 
-function showFileMenu(anchor) {
-  if (fileMenuEl) { closeFileMenu(); return; } // toggle off
+function closeFlyout() { if (flyoutEl) { flyoutEl.remove(); flyoutEl = null; } }
+
+function closeBarMenu() {
+  closeFlyout();
+  if (barMenuEl) { barMenuEl.remove(); barMenuEl = null; }
+  if (barMenuBtn) { barMenuBtn.classList.remove('open'); barMenuBtn = null; }
+  document.removeEventListener('mousedown', onBarMenuOutside, true);
+  document.removeEventListener('keydown', onBarMenuKey, true);
+}
+function onBarMenuOutside(e) {
+  if (!barMenuEl) return;
+  if (barMenuEl.contains(e.target)) return;
+  if (flyoutEl && flyoutEl.contains(e.target)) return;
+  if (e.target.closest('.menu-btn')) return;   // clicks on the bar switch menus
+  closeBarMenu();
+}
+function onBarMenuKey(e) { if (e.key === 'Escape') { e.preventDefault(); closeBarMenu(); } }
+
+// Fill a dropdown/flyout element from an items[] spec. `inFlyout` items don't
+// dismiss the flyout on hover (only top-level rows do, to close a sibling flyout).
+function buildMenuItems(container, items, inFlyout) {
+  for (const it of items) {
+    if (it.sep) { const s = document.createElement('div'); s.className = 'menu-sep'; container.appendChild(s); continue; }
+    const b = document.createElement('button');
+    b.className = 'menu-item' + (it.disabled ? ' disabled' : '') + (it.submenu ? ' has-sub' : '');
+    const hint = it.submenu ? '›' : (it.hint || '');
+    if (hint) {
+      b.innerHTML = '<span class="mi-label"></span><span class="mi-hint"></span>';
+      b.querySelector('.mi-label').textContent = it.label;
+      b.querySelector('.mi-hint').textContent = hint;
+    } else {
+      b.textContent = it.label;
+    }
+    if (it.disabled) { container.appendChild(b); continue; }
+    if (it.submenu) {
+      b.addEventListener('mouseenter', () => openFlyout(b, it.submenu));
+      b.addEventListener('click', (e) => { e.stopPropagation(); openFlyout(b, it.submenu); });
+    } else {
+      if (!inFlyout) b.addEventListener('mouseenter', closeFlyout);
+      b.addEventListener('click', () => { if (!it.keepOpen) closeBarMenu(); it.run(); });
+    }
+    container.appendChild(b);
+  }
+}
+
+// Open a right-hand flyout next to a parent row (e.g. View ▸ Split Layout).
+function openFlyout(anchorItem, items) {
+  closeFlyout();
+  const fly = document.createElement('div');
+  fly.className = 'app-menu app-submenu';
+  flyoutEl = fly;
+  buildMenuItems(fly, items, true);
+  document.body.appendChild(fly);
+  const r = anchorItem.getBoundingClientRect();
+  let left = r.right - 2;
+  if (left + fly.offsetWidth > window.innerWidth - 6) left = r.left - fly.offsetWidth + 2;  // flip left if it'd overflow
+  fly.style.left = `${Math.max(6, left)}px`;
+  fly.style.top = `${Math.max(6, r.top - 4)}px`;
+}
+
+function openBarMenu(anchor, items) {
   const menu = document.createElement('div');
   menu.className = 'app-menu';
-  fileMenuEl = menu;
+  barMenuEl = menu;
+  barMenuBtn = anchor;
+  buildMenuItems(menu, items, false);
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = `${Math.max(6, Math.min(r.left, window.innerWidth - menu.offsetWidth - 6))}px`;
+  menu.style.top = `${r.bottom + 2}px`;
+  anchor.classList.add('open');
+  setTimeout(() => {
+    document.addEventListener('mousedown', onBarMenuOutside, true);
+    document.addEventListener('keydown', onBarMenuKey, true);
+  }, 0);
+}
 
-  const items = [
+// Toggle a bar menu: close whatever's open, then open this one unless it was the
+// one already showing. Also dismisses File's theme/workspace sub-popups.
+function toggleBarMenu(anchor, buildItems) {
+  const wasOpen = barMenuBtn === anchor;
+  closeBarMenu();
+  closeThemeMenu();
+  closeWorkspaceMenu();
+  closeSettingsMenu();
+  if (!wasOpen) openBarMenu(anchor, buildItems());
+}
+
+// ---- Menu specs ------------------------------------------------------------
+function fileMenuItems() {
+  const anchor = document.getElementById('file-menu');
+  return [
     { label: 'New Window', hint: 'Ctrl+Shift+N', run: () => window.hydra.newWindow() },
     { sep: true },
     { label: 'New Workspace…', run: () => newWorkspace() },
     { label: 'Open Workspace…', run: () => showWorkspaceMenu(anchor) },
     { label: 'Edit Workspace…', run: () => editWorkspace() },
     { sep: true },
+    { label: 'Settings…', run: () => showSettingsMenu(anchor) },
     { label: 'Color Theme…', run: () => showThemeMenu(anchor) },
     { sep: true },
     { label: 'Zoom In',    hint: 'Ctrl +',  keepOpen: true, run: () => window.hydra.zoom('in') },
@@ -1495,32 +1651,142 @@ function showFileMenu(anchor) {
     { sep: true },
     { label: 'Exit', run: () => window.hydra.closeWindow() },
   ];
-  for (const it of items) {
-    if (it.sep) { const s = document.createElement('div'); s.className = 'menu-sep'; menu.appendChild(s); continue; }
-    const b = document.createElement('button');
-    b.className = 'menu-item';
-    if (it.hint) {
-      b.innerHTML = '<span class="mi-label"></span><span class="mi-hint"></span>';
-      b.querySelector('.mi-label').textContent = it.label;
-      b.querySelector('.mi-hint').textContent = it.hint;
-    } else {
-      b.textContent = it.label;
-    }
-    // Zoom items stay open so you can step repeatedly; others close on use.
-    b.addEventListener('click', () => { if (!it.keepOpen) closeFileMenu(); it.run(); });
-    menu.appendChild(b);
+}
+
+// Edit acts on the focused terminal. xterm draws to a canvas, so the usual
+// browser edit commands don't reach it — we wire the terminal-appropriate ones.
+function editMenuItems() {
+  const p = panes.get(focusedId);
+  const hasPane = !!(p && p.term);
+  const hasSel = hasPane && !!p.term.getSelection();
+  return [
+    { label: 'Copy',       hint: 'Ctrl+Shift+C', disabled: !hasSel,  run: () => copySelection() },
+    { label: 'Paste',      hint: 'Ctrl+Shift+V', disabled: !hasPane, run: () => smartPaste() },
+    { label: 'Select All', disabled: !hasPane, run: () => { const q = panes.get(focusedId); if (q && q.term) { q.term.selectAll(); focusPane(q); } } },
+    { sep: true },
+    { label: 'Clear Terminal', disabled: !hasPane, run: () => { const q = panes.get(focusedId); if (q && q.term) { q.term.clear(); flash('Terminal cleared'); } } },
+  ];
+}
+
+function viewMenuItems() {
+  const layout = [3, 4, 6, 8, 12].map((n) => ({
+    label: `${n} Panes`,
+    run: () => { if (!store.active) { newWorkspace(); return; } setPaneCount(n); },
+  }));
+  return [
+    { label: 'Add Page', hint: 'Ctrl+T', run: () => { if (!store.active) newWorkspace(); else createPane(); } },
+    { sep: true },
+    { label: 'Split Layout', submenu: layout },
+    { sep: true },
+    { label: superSaiyan ? '✓ Super Saiyan Mode' : 'Super Saiyan Mode', hint: 'F10', run: () => toggleSuperSaiyan() },
+    { label: isZen() ? '✓ Zen Mode' : 'Zen Mode', hint: 'F11', run: () => toggleZenFocused() },
+  ];
+}
+
+function helpMenuItems() {
+  return [
+    { label: 'About ClaudeIDE', run: () => openAboutDialog() },
+  ];
+}
+
+// Kept for older callers/keyboard paths that opened the File menu directly.
+function showFileMenu(anchor) { toggleBarMenu(anchor || document.getElementById('file-menu'), fileMenuItems); }
+
+// ---- File ▸ Settings (new-pane config popover) -----------------------------
+// The auto-run / notify / command / working-dir controls live in a hidden
+// #settings-menu that we simply show/position under the File button — the
+// controls keep their ids so the rest of the app reads/syncs them unchanged.
+function closeSettingsMenu() {
+  const el = document.getElementById('settings-menu');
+  if (el) el.hidden = true;
+  document.removeEventListener('mousedown', onSettingsOutside, true);
+  document.removeEventListener('keydown', onSettingsKey, true);
+}
+function onSettingsOutside(e) {
+  const el = document.getElementById('settings-menu');
+  if (el && !el.contains(e.target) && !e.target.closest('.menu-btn')) closeSettingsMenu();
+}
+function onSettingsKey(e) { if (e.key === 'Escape') { e.preventDefault(); closeSettingsMenu(); } }
+function showSettingsMenu(anchor) {
+  const el = document.getElementById('settings-menu');
+  if (!el) return;
+  if (!el.hidden) { closeSettingsMenu(); return; }   // toggle off
+  el.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  el.style.left = `${Math.max(6, Math.min(r.left, window.innerWidth - el.offsetWidth - 6))}px`;
+  el.style.top = `${r.bottom + 2}px`;
+  setTimeout(() => {
+    document.addEventListener('mousedown', onSettingsOutside, true);
+    document.addEventListener('keydown', onSettingsKey, true);
+  }, 0);
+}
+
+// ---- Help ▸ About ----------------------------------------------------------
+// Release history, newest first — surfaced in the About dialog so users can see
+// what shipped when. Keep this in step with the "Release vX" commits.
+const RELEASES = [
+  ['0.5.15', 'File/Edit/View/Help menu bar + About dialog + Settings under File'],
+  ['0.5.14', 'Smart paste text fallback + reliable Windows clipboard bridge'],
+  ['0.5.13', 'Footer shortcut hints + faster terminal scroll'],
+  ['0.5.12', 'PageUp/PageDown/End scroll the terminal scrollback'],
+  ['0.5.11', 'Terminal copy (Ctrl+Shift+C) + smart paste (Ctrl+Shift+V)'],
+  ['0.5.10', 'Split-editor button + header/explorer fixes'],
+  ['0.5.9',  'File Explorer + editor window (F4)'],
+  ['0.5.8',  'Split tabs into side-by-side editor groups'],
+  ['0.5.7',  'Open saved workspaces in a New Window'],
+  ['0.5.6',  'Finished-with-a-question reads as "needs you"'],
+  ['0.5.5',  'Fix busy pane misreported as READY'],
+  ['0.5.4',  'VSCode terminal font family'],
+  ['0.5.3',  'VSCode-matching font smoothing'],
+  ['0.5.2',  'Detector recognizes modern idle footers'],
+  ['0.5.1',  'Bottom-anchored Super Saiyan deck'],
+  ['0.5.0',  'Super Saiyan Mode'],
+  ['0.4.0',  'New Window + selectable Edit Workspace'],
+  ['0.3.2',  'Fix empty WSL folder listing (wsl --exec)'],
+  ['0.3.1',  'Fix Browse crash'],
+  ['0.3.0',  'WSL distro selection + connectivity check'],
+  ['0.2.0',  'Connection-aware Browse + two-step workspace wizard'],
+];
+
+function openAboutDialog() {
+  const version = (window.hydra && window.hydra.version) || '';
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay about-overlay';
+  overlay.innerHTML = `
+    <div class="modal about-modal">
+      <div class="about-head">
+        <span class="about-logo"><svg viewBox="0 0 24 24" width="44" height="44"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7z" fill="currentColor"/></svg></span>
+        <div class="about-id">
+          <h1 class="about-name">ClaudeIDE</h1>
+          <p class="about-by">by Rhey Minoza</p>
+          <p class="about-version"></p>
+        </div>
+      </div>
+      <p class="about-lead">A terminal-grid editor for running many Claude Code CLI sessions at once —
+        conduct a swarm of agents, each in its own terminal, and see at a glance which are
+        <strong>working</strong>, which <strong>need you</strong>, and which are <strong>done</strong>.</p>
+      <div class="about-rel-head">Releases</div>
+      <div class="about-releases"></div>
+      <div class="modal-actions"><button class="modal-ok">Close</button></div>
+    </div>`;
+
+  overlay.querySelector('.about-version').textContent = version ? `Version ${version}` : '';
+  const list = overlay.querySelector('.about-releases');
+  for (const [v, desc] of RELEASES) {
+    const row = document.createElement('div');
+    row.className = 'about-rel' + (v === version ? ' current' : '');
+    row.innerHTML = '<span class="about-rel-v"></span><span class="about-rel-d"></span>';
+    row.querySelector('.about-rel-v').textContent = v;
+    row.querySelector('.about-rel-d').textContent = desc;
+    list.appendChild(row);
   }
 
-  document.body.appendChild(menu);
-  const r = anchor.getBoundingClientRect();
-  menu.style.left = `${r.left}px`;
-  menu.style.top = `${r.bottom + 2}px`;
-  anchor.classList.add('open');
-
-  setTimeout(() => {
-    document.addEventListener('mousedown', onFileMenuOutside, true);
-    document.addEventListener('keydown', onFileMenuKey, true);
-  }, 0);
+  const done = () => overlay.remove();
+  overlay.querySelector('.modal-ok').onclick = done;
+  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) done(); });
+  overlay.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); done(); } });
+  document.body.appendChild(overlay);
+  overlay.querySelector('.modal-ok').focus();
 }
 
 // ---- color theme -----------------------------------------------------------
@@ -1530,6 +1796,8 @@ function applyTheme(id, { persist = true } = {}) {
   if (!XTERM_THEMES[id]) id = 'dark';
   themeId = id;
   document.documentElement.dataset.theme = id;
+  // The custom theme paints via inline var overrides; built-ins clear any leftovers.
+  applyInlineThemeVars(id === 'custom' && store ? store.customTheme : null);
   const palette = xtermTheme(id);
   for (const p of panes.values()) {
     try { p.term.options.theme = palette; } catch (_) { /* not yet attached */ }
@@ -1561,7 +1829,14 @@ function showThemeMenu(anchor) {
   themeMenuEl = menu;
   const original = themeId;   // for live preview on hover; restored if cancelled
 
-  for (const t of THEMES) {
+  // Built-ins, plus the saved custom theme (if any) as one more pickable entry.
+  const list = THEMES.slice();
+  if (store && store.customTheme) {
+    const c = store.customTheme;
+    list.push({ id: 'custom', name: c.name || 'Custom', swatch: (c.vars && c.vars['--bg']) || '#1e1e1e',
+      accent: (c.vars && c.vars['--accent']) || '#0078d4' });
+  }
+  for (const t of list) {
     const b = document.createElement('button');
     b.className = 'menu-item theme-item' + (t.id === themeId ? ' active' : '');
     b.innerHTML =
@@ -1579,6 +1854,15 @@ function showThemeMenu(anchor) {
   // Leaving the list without picking restores the committed theme.
   menu.addEventListener('mouseleave', () => applyTheme(original, { persist: false }));
 
+  // Customize / edit — forks whatever is applied now and opens the Theme Studio.
+  const sep = document.createElement('div'); sep.className = 'menu-sep'; menu.appendChild(sep);
+  const edit = document.createElement('button');
+  edit.className = 'menu-item';
+  edit.textContent = (store && store.customTheme) ? 'Edit Custom Theme…' : 'Customize Theme…';
+  edit.addEventListener('mouseenter', () => applyTheme(original, { persist: false }));  // stop any hover preview
+  edit.addEventListener('click', () => { closeThemeMenu(); openThemeStudio(); });
+  menu.appendChild(edit);
+
   document.body.appendChild(menu);
   const r = anchor.getBoundingClientRect();
   menu.style.left = `${r.left}px`;
@@ -1588,6 +1872,134 @@ function showThemeMenu(anchor) {
     document.addEventListener('mousedown', onThemeMenuOutside, true);
     document.addEventListener('keydown', onThemeMenuKey, true);
   }, 0);
+}
+
+// ---- Theme Studio ----------------------------------------------------------
+// A full-palette editor: forks the applied theme, lets you tweak every chrome
+// variable and terminal color with live preview, then saves as the 'custom'
+// theme. Import/Export move the theme in/out as JSON (via the clipboard).
+function openThemeStudio() {
+  // Fork whatever is applied right now: the saved custom theme, or a snapshot of
+  // the current built-in. deep-copied so edits don't mutate the live store.
+  const base = (themeId === 'custom' && store && store.customTheme)
+    ? { vars: { ...store.customTheme.vars }, term: { ...store.customTheme.term } }
+    : snapshotThemeModel();
+  const model = { name: 'Custom', vars: { ...base.vars }, term: { ...base.term } };
+  const initial = JSON.stringify(model);                 // for Reset
+  const committed = (store && store.theme) || 'dark';    // for Cancel/Escape revert
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay theme-studio-overlay';
+  overlay.innerHTML = `
+    <div class="modal theme-studio">
+      <div class="modal-title">
+        <span>Theme Studio</span>
+        <span class="ts-tools">
+          <button class="ts-tool" data-act="import">Import</button>
+          <button class="ts-tool" data-act="export">Export</button>
+        </span>
+      </div>
+      <div class="ts-hint">Edit any color — changes preview live. Save to keep it as your Custom theme.</div>
+      <div class="ts-body"></div>
+      <div class="modal-actions">
+        <button class="ts-reset ws-back">Reset</button>
+        <button class="modal-cancel">Cancel</button>
+        <button class="modal-ok ts-save">Save Theme</button>
+      </div>
+    </div>`;
+  const body = overlay.querySelector('.ts-body');
+
+  // Live-preview the in-progress model onto the running app.
+  const preview = () => {
+    applyInlineThemeVars(model);
+    for (const p of panes.values()) { try { p.term.options.theme = { ...model.term }; } catch (_) { /* not attached */ } }
+  };
+
+  // One editable color row: a native picker + a hex text field. The text field is
+  // authoritative so 8-digit (#rrggbbaa) overlay values survive — the native
+  // picker only handles 6-digit, so it just seeds/reflects the opaque part.
+  const resyncers = [];
+  const addRow = (parent, label, get, set) => {
+    const row = document.createElement('label');
+    row.className = 'ts-row';
+    row.innerHTML =
+      `<span class="ts-name"></span>`
+      + `<span class="ts-controls"><input type="color" class="ts-color"><input type="text" class="ts-hex modal-input" spellcheck="false"></span>`;
+    row.querySelector('.ts-name').textContent = label;
+    const color = row.querySelector('.ts-color');
+    const hex = row.querySelector('.ts-hex');
+    const solid = (v) => { const m = String(v).match(/^#([0-9a-fA-F]{6})/); return m ? '#' + m[1] : '#000000'; };
+    const resync = () => { const v = get() || ''; hex.value = v; color.value = solid(v); };
+    resync();
+    color.addEventListener('input', () => { set(color.value); hex.value = color.value; preview(); });
+    hex.addEventListener('input', () => { const v = hex.value.trim(); set(v); color.value = solid(v); preview(); });
+    resyncers.push(resync);
+    parent.appendChild(row);
+  };
+
+  const addGroup = (title, entries, get, set) => {
+    const sec = document.createElement('div'); sec.className = 'ts-group';
+    const h = document.createElement('div'); h.className = 'ts-group-title'; h.textContent = title; sec.appendChild(h);
+    for (const [key, label] of entries) addRow(sec, label, () => get(key), (v) => set(key, v));
+    body.appendChild(sec);
+  };
+
+  for (const g of THEME_VAR_GROUPS) addGroup(g.title, g.vars, (k) => model.vars[k], (k, v) => { model.vars[k] = v; });
+  addGroup('Terminal', TERM_KEYS, (k) => model.term[k], (k, v) => { model.term[k] = v; });
+  preview();
+
+  const close = (revert) => {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey, true);
+    if (revert) applyTheme(committed, { persist: false });   // undo the live preview
+  };
+  const onKey = (e) => {
+    // Ignore keys destined for a modal opened on top of us (e.g. the Import dialog).
+    if (!overlay.contains(e.target)) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(true); }
+  };
+
+  overlay.querySelector('.modal-cancel').onclick = () => close(true);
+  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(true); });
+  // Keep hex typing from tripping app shortcuts (Escape still handled via capture).
+  overlay.addEventListener('keydown', (e) => e.stopPropagation());
+
+  overlay.querySelector('.ts-reset').onclick = () => {
+    const f = JSON.parse(initial);
+    model.vars = { ...f.vars }; model.term = { ...f.term };
+    for (const r of resyncers) r();
+    preview();
+  };
+
+  overlay.querySelector('.ts-save').onclick = () => {
+    store.customTheme = { name: 'Custom', vars: { ...model.vars }, term: { ...model.term } };
+    XTERM_THEMES.custom = { ...model.term };
+    scheduleSave();
+    close(false);
+    applyTheme('custom');       // commit + persist store.theme = 'custom'
+    flash('Theme saved');
+  };
+
+  overlay.querySelector('[data-act="export"]').onclick = () => {
+    const json = JSON.stringify({ claudeIdeTheme: 1, name: 'Custom', vars: model.vars, term: model.term }, null, 2);
+    writeClipboardText(json).then(() => flash('Theme JSON copied')).catch(() => flash('Could not copy'));
+  };
+  overlay.querySelector('[data-act="import"]').onclick = async () => {
+    const raw = await askText({ title: 'Import theme', label: 'Paste theme JSON', multiline: true, ok: 'Apply' });
+    if (!raw) return;
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (_) { flash('Invalid JSON'); return; }
+    if (!parsed || !parsed.vars || !parsed.term) { flash('Not a theme'); return; }
+    for (const v of THEME_VARS) if (parsed.vars[v]) model.vars[v] = String(parsed.vars[v]);
+    for (const [k] of TERM_KEYS) if (parsed.term[k]) model.term[k] = String(parsed.term[k]);
+    for (const r of resyncers) r();
+    preview();
+    flash('Theme imported — review and Save');
+  };
+
+  document.body.appendChild(overlay);
+  document.addEventListener('keydown', onKey, true);
+  body.scrollTop = 0;
 }
 
 function renameTab(id, name) {
@@ -1826,6 +2238,48 @@ function askConfirm({ title, message, confirmLabel = 'Confirm', danger = false }
       if (e.key === 'Enter' && !danger) { e.preventDefault(); done(true); }
     });
     overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) done(false); });
+  });
+}
+
+// A single free-text prompt. Resolves to the entered string, or null if
+// cancelled. `multiline` swaps the input for a textarea (used for theme JSON).
+function askText({ title, label = '', value = '', placeholder = '', ok = 'OK', multiline = false }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    const field = multiline
+      ? `<textarea class="modal-input ts-import-area" spellcheck="false"></textarea>`
+      : `<input class="modal-input" type="text" spellcheck="false">`;
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-title"></div>
+        <label class="modal-label"></label>
+        ${field}
+        <div class="modal-actions">
+          <button class="modal-cancel">Cancel</button>
+          <button class="modal-ok"></button>
+        </div>
+      </div>`;
+    overlay.querySelector('.modal-title').textContent = title;
+    const lbl = overlay.querySelector('.modal-label');
+    if (label) lbl.textContent = label; else lbl.remove();
+    const input = overlay.querySelector(multiline ? 'textarea' : 'input');
+    input.value = value;
+    input.placeholder = placeholder;
+    const okBtn = overlay.querySelector('.modal-ok');
+    okBtn.textContent = ok;
+    const done = (v) => { overlay.remove(); resolve(v); };
+    okBtn.onclick = () => done(input.value);
+    overlay.querySelector('.modal-cancel').onclick = () => done(null);
+    overlay.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Escape') { e.preventDefault(); done(null); }
+      // Enter submits single-line prompts; textarea keeps Enter for newlines.
+      if (e.key === 'Enter' && !multiline) { e.preventDefault(); done(input.value); }
+    });
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) done(null); });
+    document.body.appendChild(overlay);
+    input.focus();
   });
 }
 
@@ -2640,13 +3094,16 @@ function applyStatus(p, res) {
   p.stateLabel.className = `pane-state-label state-${ui.css}`;
   p.stateLabel.textContent = (p.awaiting ? 'your turn' : (res.label || state)).slice(0, 16);
 
-  // status line = activity detail + compact meta (elapsed / tokens / context)
+  // Sub-header = a dedicated line for what Claude Code is doing on this pane:
+  // the activity detail, tinted by state, with compact meta on the right.
   const meta = res.meta || {};
   const metaBits = [meta.elapsed, meta.tokens, meta.context].filter(Boolean);
-  let text = res.detail || '';
-  if (metaBits.length) text += (text ? '   ' : '') + metaBits.join(' · ');
-  p.status.textContent = text;
-  p.status.title = text;
+  const activity = res.detail || ACTIVITY_FALLBACK[state] || '';
+  p.subhead.className = `pane-subhead subhead-${ui.css}` +
+    (state === 'working' ? ' working' : '');
+  p.activity.textContent = activity;
+  p.activity.title = activity;
+  p.metaEl.textContent = metaBits.join(' · ');
 
   // draw the eye to panes that need a human decision (or whose turn it now is)
   p.el.classList.toggle('needs-attention', attention);
@@ -2766,19 +3223,6 @@ window.hydra.onFocusPane(({ id }) => {
 });
 
 // ---- toolbar ---------------------------------------------------------------
-// With no tab open there's nowhere to put a pane, so these start a workspace.
-document.getElementById('add-pane').addEventListener('click', () => {
-  if (!store.active) { newWorkspace(); return; }
-  createPane();
-});
-
-document.querySelectorAll('.layout-btn').forEach((b) => {
-  b.addEventListener('click', () => {
-    if (!store.active) { newWorkspace(); return; }
-    setPaneCount(parseInt(b.dataset.n, 10));
-  });
-});
-
 // Welcome screen (shown when no tab is open) actions.
 document.getElementById('welcome-new').addEventListener('click', () => newWorkspace());
 document.getElementById('welcome-open').addEventListener('click', (e) =>
@@ -2796,13 +3240,21 @@ document.addEventListener('keydown', (e) => {
   if (handleShortcut(e)) e.preventDefault();
 });
 
-// File menu + jump controls
-document.getElementById('file-menu').addEventListener('click', (e) => {
-  e.stopPropagation();
-  showFileMenu(e.currentTarget);
-});
+// Menu bar (File / Edit / View / Help). Clicking a button toggles its dropdown;
+// hovering another while one is open switches to it (VSCode behaviour).
+const BAR_MENUS = [
+  ['file-menu', fileMenuItems],
+  ['edit-menu', editMenuItems],
+  ['view-menu', viewMenuItems],
+  ['help-menu', helpMenuItems],
+];
+for (const [id, build] of BAR_MENUS) {
+  const btn = document.getElementById(id);
+  if (!btn) continue;
+  btn.addEventListener('click', (e) => { e.stopPropagation(); toggleBarMenu(btn, build); });
+  btn.addEventListener('mouseenter', () => { if (barMenuBtn && barMenuBtn !== btn) toggleBarMenu(btn, build); });
+}
 document.getElementById('jump-attn').addEventListener('click', jumpToAttention);
-document.getElementById('ss-toggle').addEventListener('click', toggleSuperSaiyan);
 document.getElementById('remote-indicator').addEventListener('click', (e) => {
   e.stopPropagation();
   editActiveWorkspace();   // the pill edits THIS tab's workspace connection
@@ -2942,6 +3394,10 @@ window.addEventListener('beforeunload', () => { clearTimeout(saveTimer); saveSta
   store = normalizeStore(await window.hydra.loadState());
   ensureGroups();        // validate the group structure…
   ensureGroupsDom();     // …and build its DOM before any pane is parented into it
+
+  // A saved custom theme lives on the store — register its terminal palette so
+  // the guard below accepts 'custom' and panes spawn with its colors.
+  if (store.customTheme && store.customTheme.term) XTERM_THEMES.custom = { ...store.customTheme.term };
 
   // Apply the saved color theme before any terminal is created, so panes spawn
   // with the right palette and the chrome paints correctly from the first frame.

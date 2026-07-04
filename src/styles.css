@@ -206,8 +206,6 @@ body { display: flex; flex-direction: column; }
 }
 #toolbar input[type="text"]:focus { outline: none; border-color: var(--focus); }
 #toolbar input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
-#cmd { width: 130px; }
-#cwd { flex: 0 1 200px; min-width: 60px; }
 .auto { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 14px; cursor: pointer; }
 .summary { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
@@ -421,7 +419,7 @@ body { display: flex; flex-direction: column; }
 }
 .tab.active .tab-num { color: var(--text); opacity: 1; }
 .tab-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dead); flex: 0 0 auto; }
-.tab-dot.busy     { background: var(--busy); animation: pulse 1s infinite; }
+.tab-dot.busy     { background: var(--busy); }
 .tab-dot.ready    { background: var(--ready); }
 .tab-dot.approval { background: var(--attn); animation: pulse 0.8s infinite; box-shadow: 0 0 5px var(--attn); }
 .tab-dot.error    { background: var(--error); }
@@ -575,7 +573,7 @@ body.no-tabs #welcome {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--dead); flex: 0 0 auto;
 }
-.dot.busy    { background: var(--busy); animation: pulse 1s infinite; }
+.dot.busy    { background: var(--busy); }
 .dot.ready   { background: var(--ready); }
 .dot.waiting { background: var(--waiting); animation: pulse 1.4s infinite; }
 .dot.approval{ background: var(--attn); animation: pulse 0.8s infinite; box-shadow: 0 0 5px var(--attn); }
@@ -597,13 +595,50 @@ body.no-tabs #welcome {
 /* a live (program-set) title reads as content, not a fixed label — lighter weight */
 .pane.auto-title .pane-title { font-weight: 500; color: var(--bright); }
 
-.pane-status {
-  flex: 1;
+/* pushes the pane's action buttons to the right edge of the header */
+.head-spacer { flex: 1; min-width: 0; }
+
+/* ---- pane sub-header: what Claude Code is working on, one line, own strip ---- */
+.pane-subhead {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 22px;
+  padding: 0 10px 0 12px;
+  flex: 0 0 auto;
+  background: color-mix(in srgb, var(--panel) 55%, var(--bg));
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
   color: var(--muted);
-  font-size: 14px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  font-variant-numeric: tabular-nums;
+  overflow: hidden;
 }
+/* leading marker: a small dot echoing the pane state, animated while working */
+.subhead-ico {
+  width: 6px; height: 6px; border-radius: 50%;
+  flex: 0 0 auto;
+  background: currentColor;
+  opacity: 0.7;
+}
+.pane-subhead.working .subhead-ico { animation: pulse 1.2s infinite; }
+.pane-activity {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pane-meta {
+  flex: 0 0 auto;
+  color: var(--muted);
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+}
+/* state tint — the activity text (and its dot) take the pane's state color so a
+   glance across panes reads working (blue) vs needs-you (amber) at once. */
+.subhead-busy    { color: var(--busy); }
+.subhead-approval{ color: var(--attn); }
+.subhead-error   { color: var(--error); }
+.subhead-ready   { color: var(--muted); }
+.subhead-dead    { color: var(--dead); }
 .pane-state-label {
   font-size: 14px;
   text-transform: uppercase;
@@ -846,7 +881,8 @@ body.zen .pane.zen-target {
 }
 /* Melt away the pane chrome too, so its ✕ close button doesn't peek out
    behind the floating exit affordance (which lives in the same corner). */
-body.zen .pane.zen-target .pane-head { display: none; }
+body.zen .pane.zen-target .pane-head,
+body.zen .pane.zen-target .pane-subhead { display: none; }
 @keyframes zenIn {
   from { opacity: 0.55; transform: scale(0.99); }
   to   { opacity: 1; transform: none; }
@@ -919,7 +955,28 @@ body.zen #zen-exit { display: inline-flex; align-items: center; gap: 6px; opacit
 .ws-menu-new:hover { background: var(--panel-2); border-radius: var(--radius-sm); }
 .ws-empty { color: var(--muted); font-size: 14px; padding: 8px; }
 
-/* ---- title-bar File menu ---- */
+/* ---- title-bar menu bar (File / Edit / View / Help) ---- */
+.menubar { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+/* Empty, draggable stretch that keeps the window controls flush right. */
+.toolbar-spacer { flex: 1 1 auto; align-self: stretch; min-width: 0; }
+
+/* ---- File ▸ Settings popover (new-pane config) ---- */
+.settings-menu { min-width: 280px; padding: 8px; }
+.settings-head { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 2px 6px 8px; }
+.settings-check {
+  display: flex; align-items: center; gap: 8px; padding: 6px;
+  font-size: 13px; color: var(--text); cursor: pointer; border-radius: var(--radius-sm);
+}
+.settings-check:hover { background: var(--btn-hover); color: var(--bright); }
+.settings-check input { accent-color: var(--accent); margin: 0; flex: 0 0 auto; }
+.settings-field { display: flex; flex-direction: column; gap: 4px; padding: 6px; }
+.settings-label { font-size: 12px; color: var(--muted); }
+.settings-menu input[type="text"] {
+  box-sizing: border-box; width: 100%;
+  background: var(--input); border: 1px solid var(--border-2); border-radius: var(--radius-sm);
+  color: var(--text); padding: 5px 8px; font-size: 13px;
+}
+.settings-menu input[type="text"]:focus { outline: none; border-color: var(--focus); }
 .menu-btn {
   background: transparent !important;
   border: 1px solid transparent !important;
@@ -951,6 +1008,31 @@ body.zen #zen-exit { display: inline-flex; align-items: center; gap: 6px; opacit
 .app-menu .menu-item:has(.mi-hint) { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .app-menu .mi-hint { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 .app-menu .menu-item:hover .mi-hint { color: inherit; }
+/* flyout submenu (e.g. View ▸ Split Layout) sits above its parent */
+.app-submenu { z-index: 97; min-width: 150px; }
+.app-menu .menu-item.has-sub .mi-hint { font-size: 16px; line-height: 1; }
+
+/* ---- Help ▸ About dialog ---- */
+.about-modal { width: 460px; max-width: 92vw; display: flex; flex-direction: column; max-height: 84vh; }
+.about-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+.about-logo { color: var(--accent); display: inline-flex; flex: 0 0 auto; }
+.about-name { font-size: 20px; font-weight: 600; margin: 0; }
+.about-by { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+.about-version { color: var(--accent); font-size: 13px; margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.about-lead { color: var(--text); font-size: 13px; line-height: 1.55; margin: 0 0 14px; }
+.about-lead strong { color: var(--bright); font-weight: 600; }
+.about-rel-head { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
+.about-releases {
+  overflow-y: auto; flex: 1 1 auto; min-height: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px;
+}
+.about-rel { display: flex; gap: 10px; padding: 5px 8px; border-radius: var(--radius-sm); font-size: 13px; }
+.about-rel:hover { background: var(--btn-hover); }
+.about-rel-v { flex: 0 0 48px; color: var(--accent); font-variant-numeric: tabular-nums; }
+.about-rel-d { color: var(--text); }
+.about-rel.current { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.about-rel.current .about-rel-v { font-weight: 700; }
+.about-modal .modal-actions { margin-top: 14px; display: flex; justify-content: flex-end; }
 
 /* ---- color-theme picker ---- */
 .theme-menu { min-width: 240px; }
@@ -967,6 +1049,42 @@ body.zen #zen-exit { display: inline-flex; align-items: center; gap: 6px; opacit
 .theme-menu .theme-check { color: var(--accent); font-size: 14px; opacity: 0; flex: 0 0 auto; }
 .theme-menu .menu-item.active .theme-check { opacity: 1; }
 .theme-menu .menu-item.active .theme-name { font-weight: 600; }
+
+/* ---- Theme Studio (full-palette editor) ---- */
+.theme-studio-overlay { align-items: center; padding-top: 0; }
+.theme-studio { width: 560px; max-width: 92vw; max-height: 86vh; display: flex; flex-direction: column; }
+.theme-studio .ts-tools { display: flex; gap: 6px; }
+.theme-studio .ts-tool {
+  background: var(--btn); color: var(--text); border: 1px solid transparent;
+  border-radius: var(--radius-sm); padding: 3px 10px; cursor: pointer; font-size: 13px;
+}
+.theme-studio .ts-tool:hover { background: var(--btn-hover); color: var(--bright); }
+.theme-studio .ts-hint { color: var(--muted); font-size: 13px; margin: 2px 0 12px; }
+.theme-studio .ts-body {
+  overflow-y: auto; margin: 0 -20px; padding: 2px 20px;
+  columns: 2; column-gap: 22px;
+}
+.theme-studio .ts-group { break-inside: avoid; margin-bottom: 14px; }
+.theme-studio .ts-group-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); font-weight: 600; margin: 2px 0 6px; padding-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+}
+.theme-studio .ts-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; cursor: default; }
+.theme-studio .ts-name { flex: 1; font-size: 13px; color: var(--text); min-width: 0; }
+.theme-studio .ts-controls { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.theme-studio .ts-color {
+  width: 26px; height: 22px; padding: 0; border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm); background: none; cursor: pointer; flex: 0 0 auto;
+}
+.theme-studio .ts-color::-webkit-color-swatch-wrapper { padding: 2px; }
+.theme-studio .ts-color::-webkit-color-swatch { border: none; border-radius: 1px; }
+.theme-studio .ts-hex {
+  width: 92px; font-family: var(--mono, monospace); font-size: 12px;
+  padding: 3px 6px; text-transform: lowercase;
+}
+.theme-studio .modal-actions .ts-reset { margin-right: auto; }
+.ts-import-area { min-height: 160px; resize: vertical; font-family: var(--mono, monospace); font-size: 12px; line-height: 1.5; }
 
 /* ---- Super Saiyan Mode ---- */
 :root { --ss-aura: #ffc23d; --ss-aura-2: #ff8a00; }

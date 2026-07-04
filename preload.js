@@ -49,6 +49,9 @@ contextBridge.exposeInMainWorld('hydra', {
   // renderer can theme the chrome before the first paint.
   initialTheme: (process.argv.find((a) => a.startsWith('--hydra-theme=')) || '').split('=')[1] || 'dark',
 
+  // App version (read straight from package.json) for the Help ▸ About dialog.
+  version: (() => { try { return require('./package.json').version; } catch (_e) { return ''; } })(),
+
   // Custom title-bar window controls.
   minimize: () => ipcRenderer.send('win:minimize'),
   toggleMaximize: () => ipcRenderer.send('win:toggle-maximize'),
