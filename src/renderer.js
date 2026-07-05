@@ -1800,6 +1800,7 @@ function showSettingsMenu(anchor) {
 // Release history, newest first — surfaced in the About dialog so users can see
 // what shipped when. Keep this in step with the "Release vX" commits.
 const RELEASES = [
+  ['0.5.20', 'Ctrl+C copies the terminal selection (interrupts when nothing is selected); toolbar "Add Terminal" button; smoother title-bar drag; PowerShell auto-run no longer chokes on "&&"; View menu "Add Pane" label fix'],
   ['0.5.19', 'Fluid pane grid: a partial last row widens its panes — no more vacant cells'],
   ['0.5.18', 'Drag a maximized window to tear it off at half size; drop at a monitor\'s top edge to re-maximize'],
   ['0.5.17', 'Smart paste moves to plain Ctrl+V (Ctrl+Shift+V still works)'],
