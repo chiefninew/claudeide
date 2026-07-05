@@ -23,6 +23,7 @@ let focusedId = null;   // id of the currently focused pane (drives the git foot
 let zenFitTimer = null; // refit after the zen transition settles
 let tabSeq = 0;         // monotonic counter for unique tab instance ids
 let gSeq = 0;           // monotonic counter for unique editor-group ids
+let isDetachedWindow = false; // true in an "Open in New Window" window (ephemeral: never persists)
 
 // How many bottom rows of the live screen the detector inspects.
 const SCREEN_ROWS = 30;
@@ -566,7 +567,13 @@ function pathsFromDataTransfer(dt, allowPlainText) {
 function createPane(opts = {}) {
   const workspace = opts.workspace || store.active;
   if (!workspace) return null;   // no tab to host it (welcome screen) — caller starts one
-  const id = `p${++seq}`;
+  // Adopted panes ("Open in New Window") keep their original id — it's the key of
+  // the still-live pty in main — so the new xterm re-attaches to the same session.
+  const id = opts.forceId || `p${++seq}`;
+  if (opts.forceId) {
+    const n = parseInt(String(opts.forceId).replace(/^p/, ''), 10);
+    if (Number.isFinite(n) && n > seq) seq = n;   // keep local ids from colliding
+  }
   const label = opts.label || `Agent ${panesOf(workspace).length + 1}`;
 
   const el = document.createElement('div');
@@ -652,8 +659,8 @@ function createPane(opts = {}) {
     // (Claude Code) sets via an OSC escape — "what I'm working on". `seed` is the
     // fallback name shown before any title arrives. A manual rename `pinned`s a
     // fixed `label` so the live title stops overriding it (clear it to un-pin).
-    seed: label,
-    auto: '',
+    seed: opts.seed != null ? opts.seed : label,
+    auto: opts.auto || '',
     pinned: !!opts.pinned,
     // Each pane remembers its own working dir + command so the tab can be
     // restored exactly. New panes inherit the current toolbar template.
@@ -801,11 +808,31 @@ function createPane(opts = {}) {
     e.preventDefault();
     toggleZen(p);
   });
+  // Right-click the title bar: pane actions (currently "Open in New Window").
+  // The editable title keeps its own native menu.
+  head.addEventListener('contextmenu', (e) => {
+    if (e.target.closest('.pane-title')) return;
+    e.preventDefault();
+    showPaneMenu(e, p);
+  });
 
-  spawnPty(p);
+  if (opts.adopt) attachAdopted(p, opts); else spawnPty(p);
   if (visibleTabIds().has(workspace)) { relayout(); focusPane(p); }
   scheduleSave();
   return p;
+}
+
+// Attach a fresh xterm to a pty that already exists in main (handed over by
+// another window). We don't spawn — we resize the live pty to this window's
+// pane, then buffer its incoming output until the seed (a serialized snapshot of
+// its screen from the source window) arrives, so scrollback shows up in order.
+function attachAdopted(p, opts) {
+  p.pid = opts.pid || null;
+  p.awaitingSeed = true;   // hold live output until the seed is written first
+  p.seedBuf = [];
+  fitPane(p);
+  window.hydra.resize(p.id, p.term.cols || 80, p.term.rows || 24);
+  applyStatus(p, { state: 'ready', label: 'ready', detail: 'shell ready', meta: {} });
 }
 
 async function spawnPty(p) {
@@ -1143,6 +1170,12 @@ function currentToolbar() {
 // mirrored into the recents registry so the workspace's settings stay fresh.
 function saveState() {
   if (!store) return;
+  // A detached "Open in New Window" window is ephemeral: it shares the process
+  // (and the one workspace.json) with the main window, so persisting here would
+  // clobber the main window's layout. The main window stays the source of truth;
+  // the moved tab lives only for this session (its PTYs don't survive a restart
+  // anyway). See detachTabToWindow / adoptBoot.
+  if (isDetachedWindow) return;
   for (const id of store.open) {
     if (!store.tabs[id]) continue;
     store.tabs[id].panes = panesOf(id).map((p) => ({
@@ -2253,6 +2286,156 @@ function moveTabToGroup(id, targetGroupId) {
   flash('moved tab');
 }
 
+// "Open in New Window": hand this tab (with its LIVE panes) to a detached
+// window on another screen. The PTYs never die — they stay in this process and
+// just re-route their output to the new window; we hold this tab intact until
+// main tells us (tab:release) the new window has attached, then we serialize
+// each pane's scrollback as a seed and let the panes go without killing them.
+// The handoff spec for one live pane. Its id is kept as-is — it's the key of the
+// still-live pty in main, so the new window re-attaches to the same session.
+function paneHandoffSpec(p) {
+  return {
+    id: p.id,
+    seed: p.seed, label: p.label, pinned: p.pinned, auto: p.auto,
+    cwd: p.cwd, command: p.command, target: p.target, pid: p.pid,
+    cols: p.term.cols || 80, rows: p.term.rows || 24,
+  };
+}
+
+// Hand a set of live panes (wrapped in a tab) to a new detached window. The
+// actual release of these panes happens later in the onTabRelease handler, once
+// the new window has built them and adopted the ptys.
+async function handoffToNewWindow(tabMeta, panesList) {
+  const res = await window.hydra.detachTab({
+    tab: tabMeta, panes: panesList.map(paneHandoffSpec),
+  });
+  return !!(res && res.ok);
+}
+
+async function detachTabToWindow(id) {
+  const t = store.tabs[id];
+  if (!t) return;
+  const tabPanes = panesOf(id);
+  if (!tabPanes.length) { flash('nothing to move'); return; }
+  if (isZen()) exitZen();
+  // Commit the live toolbar if this is the active tab, so the new window sees it.
+  if (id === store.active) t.toolbar = currentToolbar();
+  const ok = await handoffToNewWindow({ name: t.name, toolbar: t.toolbar }, tabPanes);
+  flash(ok ? 'opening in new window…' : 'could not open window');
+}
+
+// Move a single pane to a new window. The new window gets a one-pane tab that
+// inherits this pane's workspace name + toolbar (so restart / add-pane / the
+// connection all behave); the source tab keeps whatever panes remain.
+async function detachPaneToWindow(p) {
+  if (!p || !panes.has(p.id)) return;
+  if (isZen()) exitZen();
+  const t = store.tabs[p.workspace];
+  if (p.workspace === store.active && t) t.toolbar = currentToolbar();
+  const meta = {
+    name: (t && t.name) || (p.auto || p.seed || 'Terminal'),
+    toolbar: (t && t.toolbar) || defaultToolbar(),
+  };
+  const ok = await handoffToNewWindow(meta, [p]);
+  flash(ok ? 'opening pane in new window…' : 'could not open window');
+}
+
+// Main asks us to let go of these panes (their new window is attached): serialize
+// each one's screen into a seed the new window writes first, then drop the panes
+// WITHOUT killing the ptys, and remove the now-empty tab from this window.
+window.hydra.onTabRelease(({ ids, toWcId }) => {
+  if (!ids || !ids.length) return;
+  const first = panes.get(ids[0]);
+  const wsId = first ? first.workspace : null;
+  const releasedFocused = ids.includes(focusedId);
+  for (const id of ids) {
+    const p = panes.get(id);
+    if (!p) continue;
+    let data = '';
+    try { data = p.serialize.serialize(); } catch (_) {}
+    window.hydra.ptySeed({ toWcId, id, data });
+    // Release, not close: no window.hydra.kill — the pty lives on in the new window.
+    try { p.term.dispose(); } catch (_) {}
+    p.el.remove();
+    panes.delete(id);
+    ssSuppressed.delete(id);
+  }
+  if (!wsId) return;
+  if (panesOf(wsId).length) {
+    // A single pane was peeled off — the tab stays. Reflow the grid to fill the
+    // gap and keep focus in the tab.
+    relayout();
+    for (const q of visiblePanes()) fitPane(q);
+    if (releasedFocused) { const nx = panesOf(wsId)[0]; if (nx) focusPane(nx); }
+    updateSummary();
+    saveState();
+  } else {
+    // The tab is now empty (whole-tab move, or its last pane left) — drop it.
+    removeMovedTab(wsId);
+  }
+});
+
+// Drop a tab that has moved to another window: like closeTab's teardown but its
+// panes are already released (not killed) and it isn't kept in recents.
+function removeMovedTab(wsId) {
+  const t = store.tabs[wsId];
+  delete store.tabs[wsId];
+  const g = groupOf(wsId);
+  const wasActiveTab = wsId === store.active;
+  const wasFocusedGroup = g && g.id === store.activeGroup;
+  if (g) {
+    g.open = g.open.filter((x) => x !== wsId);
+    if (g.active === wsId) g.active = g.open[0] || null;
+    if (!g.open.length) store.groups = store.groups.filter((x) => x !== g);
+  }
+  if (!store.groups.find((x) => x.id === store.activeGroup)) {
+    store.activeGroup = store.groups[0] ? store.groups[0].id : null;
+  }
+  syncOpenActive();
+  if (wasActiveTab || wasFocusedGroup || !store.open.length) {
+    if (isZen()) exitZen();
+    showActiveWorkspace();
+    const firstPane = store.active ? panesOf(store.active)[0] : null;
+    if (firstPane) focusPane(firstPane);
+  } else {
+    renderTabs();
+    updateSummary();
+  }
+  saveState();
+  if (t) flash(`moved “${t.name}” to new window`);
+}
+
+// The adopting side of "Open in New Window": build the handed-off tab in this
+// (fresh, empty) window and re-attach an xterm to each still-live pty, then tell
+// main we're ready so it switches pty ownership here and the source releases.
+function buildAdoptedTab(adoption) {
+  const { tab, panes: specs, sourceWcId } = adoption;
+  const id = 't' + (++tabSeq);
+  store.tabs[id] = { name: tab.name, toolbar: { ...tab.toolbar }, panes: [] };
+  let g = activeGroupObj();
+  if (!g) { g = { id: 'g' + (++gSeq), open: [], active: null, flex: 1 }; store.groups.push(g); }
+  g.open.push(id);
+  g.active = id;
+  store.activeGroup = g.id;
+  syncOpenActive();
+  restoreToolbar(store.tabs[id].toolbar);
+  renderRemote();
+
+  const ids = [];
+  for (const sp of specs) {
+    createPane({
+      workspace: id, adopt: true, forceId: sp.id, pid: sp.pid,
+      seed: sp.seed, auto: sp.auto, pinned: sp.pinned,
+      label: sp.pinned ? sp.label : '',
+      cwd: sp.cwd, command: sp.command, target: sp.target,
+    });
+    ids.push(sp.id);
+  }
+  showActiveWorkspace();   // parent panes into the grid + lay them out + fit
+  // We're attached and buffering — hand ownership over and pull the scrollback.
+  window.hydra.adoptReady({ ids, sourceWcId });
+}
+
 // Split: peel a tab off into a NEW group inserted just to the right of its own.
 function splitTabRight(id) {
   const src = groupOf(id);
@@ -2315,6 +2498,8 @@ function showTabMenu(ev, id) {
   tabMenuEl = menu;
 
   const items = [
+    { label: 'Open in New Window', run: () => detachTabToWindow(id) },
+    { sep: true },
     { label: 'Split Right (new group)', disabled: src.open.length < 2, run: () => splitTabRight(id) },
   ];
   const others = store.groups.filter((g) => g.id !== src.id);
@@ -2338,6 +2523,41 @@ function showTabMenu(ev, id) {
 
   document.body.appendChild(menu);
   // Keep the menu on-screen near the cursor.
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const r = menu.getBoundingClientRect();
+  menu.style.left = `${Math.min(ev.clientX, vw - r.width - 4)}px`;
+  menu.style.top = `${Math.min(ev.clientY, vh - r.height - 4)}px`;
+  setTimeout(() => {
+    document.addEventListener('mousedown', onTabMenuOutside, true);
+    document.addEventListener('keydown', onTabMenuKey, true);
+  }, 0);
+}
+
+// Right-click a pane's title bar: peel it into its own window, or the same
+// restart/close the header buttons offer. Reuses the tab-menu plumbing (one
+// popup at a time, same outside-click / Escape handling).
+function showPaneMenu(ev, p) {
+  closeTabMenu();
+  const menu = document.createElement('div');
+  menu.className = 'app-menu';
+  tabMenuEl = menu;
+
+  const items = [
+    { label: 'Open in New Window', run: () => detachPaneToWindow(p) },
+    { sep: true },
+    { label: 'Restart', run: () => runCommand(p) },
+    { label: 'Close Pane', run: () => closePane(p) },
+  ];
+  for (const it of items) {
+    if (it.sep) { const s = document.createElement('div'); s.className = 'menu-sep'; menu.appendChild(s); continue; }
+    const b = document.createElement('button');
+    b.className = 'menu-item';
+    b.textContent = it.label;
+    b.addEventListener('click', () => { closeTabMenu(); it.run(); });
+    menu.appendChild(b);
+  }
+
+  document.body.appendChild(menu);
   const vw = window.innerWidth, vh = window.innerHeight;
   const r = menu.getBoundingClientRect();
   menu.style.left = `${Math.min(ev.clientX, vw - r.width - 4)}px`;
@@ -3388,6 +3608,9 @@ function updateSummary() {
 window.hydra.onData(({ id, data }) => {
   const p = panes.get(id);
   if (!p) return;
+  // Mid-handoff (this pane was just adopted): hold live output until the seed
+  // snapshot has been written, then it's flushed in order (see onPaneSeed).
+  if (p.awaitingSeed) { p.seedBuf.push(data); return; }
   p.term.write(data);
   p.lastData = performance.now();
   // Live Super Saiyan mirror of the front pane sees the same stream.
@@ -3401,6 +3624,21 @@ window.hydra.onExit(({ id }) => {
   if (!p) return;
   p.exited = true;
   applyStatus(p, { state: 'dead', label: 'exited', detail: 'process exited', meta: {} });
+});
+
+// End of an "Open in New Window" handoff: write the source's scrollback snapshot,
+// then flush the live output we buffered while waiting for it — so history and
+// live stream land in the right order with nothing lost.
+window.hydra.onPaneSeed(({ id, data }) => {
+  const p = panes.get(id);
+  if (!p) return;
+  if (data) { try { p.term.write(data); } catch (_) {} }
+  const buf = p.seedBuf || [];
+  p.awaitingSeed = false;
+  p.seedBuf = null;
+  for (const chunk of buf) p.term.write(chunk);
+  p.lastData = performance.now();
+  fitPane(p);
 });
 
 // Clicking a desktop notification focuses (and scrolls to) the right pane,
@@ -3597,15 +3835,35 @@ window.addEventListener('drop', (e) => {
   if (isExternalFileDrag(e)) e.preventDefault();
 });
 
-// flush a save synchronously when the window is closing
-window.addEventListener('beforeunload', () => { clearTimeout(saveTimer); saveState(); });
+// Window closing: the main window flushes a save; a detached "Open in New Window"
+// window never persists, but must kill its own (adopted) terminals so they don't
+// linger as orphan ptys in the shared process after the window is gone.
+window.addEventListener('beforeunload', () => {
+  clearTimeout(saveTimer);
+  if (isDetachedWindow) { for (const p of panes.values()) window.hydra.kill(p.id); }
+  else saveState();
+});
 
 // ---- boot ------------------------------------------------------------------
 (async function boot() {
   env = await window.hydra.envInfo();
   document.getElementById('cwd').placeholder = `working dir (default: ${env.home})`;
 
-  store = normalizeStore(await window.hydra.loadState());
+  // "Open in New Window": if main handed this window a tab to adopt, we boot with
+  // a fresh (empty) store instead of the saved workspaces — but still inherit the
+  // main window's look (theme/fonts/zoom). We never persist (see saveState).
+  const adoption = await window.hydra.getAdoption();
+  isDetachedWindow = !!adoption;
+  const saved = normalizeStore(await window.hydra.loadState());
+  if (adoption) {
+    store = freshStore();
+    store.theme = saved.theme;
+    store.customTheme = saved.customTheme;
+    store.fonts = saved.fonts;
+    store.zoom = saved.zoom;
+  } else {
+    store = saved;
+  }
   ensureGroups();        // validate the group structure…
   ensureGroupsDom();     // …and build its DOM before any pane is parented into it
 
@@ -3642,22 +3900,28 @@ window.addEventListener('beforeunload', () => { clearTimeout(saveTimer); saveSta
   delete store.remote;
   renderRemote();   // paint the active workspace's connection
 
-  // Bring up every OPEN tab's panes (all alive); closed workspaces in the
-  // recents registry stay dormant until reopened. Visibility hides inactive tabs.
-  for (const id of store.open) {
-    const t = store.tabs[id];
-    for (const sp of t.panes || []) {
-      createPane({ workspace: id, label: sp.label, pinned: sp.pinned, cwd: sp.cwd, command: sp.command });
+  if (adoption) {
+    // Detached window: build the single handed-off tab and re-attach its live
+    // panes (this also signals main that we're ready to take pty ownership).
+    buildAdoptedTab(adoption);
+  } else {
+    // Bring up every OPEN tab's panes (all alive); closed workspaces in the
+    // recents registry stay dormant until reopened. Visibility hides inactive tabs.
+    for (const id of store.open) {
+      const t = store.tabs[id];
+      for (const sp of t.panes || []) {
+        createPane({ workspace: id, label: sp.label, pinned: sp.pinned, cwd: sp.cwd, command: sp.command });
+      }
     }
+    // An open-but-empty active tab gets seeded with the default panes. A fresh
+    // install has no active tab at all (store.active === null) — it boots straight
+    // to the welcome screen, with no default workspace loaded.
+    if (store.active && store.tabs[store.active] && !panesOf(store.active).length) {
+      restoreToolbar(store.tabs[store.active].toolbar);
+      setPaneCount(DEFAULT_PANES);
+    }
+    showActiveWorkspace();
   }
-  // An open-but-empty active tab gets seeded with the default panes. A fresh
-  // install has no active tab at all (store.active === null) — it boots straight
-  // to the welcome screen, with no default workspace loaded.
-  if (store.active && store.tabs[store.active] && !panesOf(store.active).length) {
-    restoreToolbar(store.tabs[store.active].toolbar);
-    setPaneCount(DEFAULT_PANES);
-  }
-  showActiveWorkspace();
 
   setInterval(tick, 400);
   // Keep the git footer fresh — branch/cwd can change inside the terminal

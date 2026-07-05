@@ -11,6 +11,25 @@ contextBridge.exposeInMainWorld('hydra', {
   kill: (id) => ipcRenderer.send('pty:kill', { id }),
   envInfo: () => ipcRenderer.invoke('env:info'),
   newWindow: () => ipcRenderer.invoke('window:new'),
+  // "Open in New Window" (tab context menu). detachTab hands the tab spec to
+  // main, which opens a detached window that adopts the tab's live PTYs.
+  // getAdoption: a booting window claims the tab handed to it (null if none).
+  // adoptReady: the new window has attached — tell main to switch pty ownership
+  // and ask the source to release. ptySeed: source ships a scrollback snapshot.
+  detachTab: (payload) => ipcRenderer.invoke('window:detachTab', payload),
+  getAdoption: () => ipcRenderer.invoke('window:getAdoption'),
+  adoptReady: (payload) => ipcRenderer.send('pty:adoptReady', payload),
+  ptySeed: (payload) => ipcRenderer.send('pty:seed', payload),
+  onPaneSeed: (cb) => {
+    const fn = (_e, payload) => cb(payload);
+    ipcRenderer.on('pane:seed', fn);
+    return () => ipcRenderer.removeListener('pane:seed', fn);
+  },
+  onTabRelease: (cb) => {
+    const fn = (_e, payload) => cb(payload);
+    ipcRenderer.on('tab:release', fn);
+    return () => ipcRenderer.removeListener('tab:release', fn);
+  },
   notify: (payload) => ipcRenderer.invoke('notify', payload),
   loadState: () => ipcRenderer.invoke('state:load'),
   saveState: (state) => ipcRenderer.invoke('state:save', state),

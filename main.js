@@ -10,6 +10,24 @@ const pty = require('node-pty');
 let mainWindow = null;   // the single app window
 let ipcReady = false;    // guard so handlers register exactly once
 
+// Every app window (index.html) in THIS process — the main one plus any
+// "Open in New Window" detached windows. Detached windows share this process
+// (and therefore the live PTYs) so a moved tab keeps its running session; a
+// separate OS process could not, since node-pty handles can't cross processes.
+const appWindows = new Set();
+// Tab payloads waiting for a just-created detached window to boot and claim
+// them: keyed by that window's webContents id (see window:detachTab / getAdoption).
+const pendingAdoption = new Map();
+
+// Find any live app window by its webContents id (used to route handoff seeds
+// from the source window to the adopting one).
+function winByWcId(id) {
+  for (const w of appWindows) {
+    if (!w.isDestroyed() && w.webContents.id === id) return w;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Notifications.
 //
@@ -121,6 +139,16 @@ function defaultShell() {
 
 function send(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+}
+
+// Route a pty's output to the window that currently owns it. The owner is the
+// window that created the pty, or — after "Open in New Window" — the detached
+// window that adopted it. Falls back to the main window if the owner is gone.
+function sendToPty(id, channel, payload) {
+  const entry = ptys.get(id);
+  const wc = entry && entry.owner && !entry.owner.isDestroyed() ? entry.owner : null;
+  if (wc) wc.send(channel, payload);
+  else send(channel, payload);
 }
 
 // "Maximize" = OS fullscreen. On WSLg neither native maximize() nor manual
@@ -439,7 +467,7 @@ function writeFileViaShell(mode, hostOrDistro, filePath, content, via) {
   });
 }
 
-function createPty({ id, cols, rows, cwd, target }) {
+function createPty({ id, cols, rows, cwd, target }, owner) {
   const want = normalizeCwd(cwd);
   const spec = resolveTarget(target, cwd);
 
@@ -466,14 +494,14 @@ function createPty({ id, cols, rows, cwd, target }) {
     spec.cwd = proc.cwd || os.homedir();
   }
 
-  ptys.set(id, { proc, exited: false });
+  ptys.set(id, { proc, exited: false, owner: owner || (mainWindow && mainWindow.webContents) });
 
-  proc.onData((data) => send('pty:data', { id, data }));
+  proc.onData((data) => sendToPty(id, 'pty:data', { id, data }));
 
   proc.onExit(({ exitCode }) => {
     const entry = ptys.get(id);
     if (entry) entry.exited = true;
-    send('pty:exit', { id, code: exitCode });
+    sendToPty(id, 'pty:exit', { id, code: exitCode });
   });
 
   // Return the normalized path so the renderer persists/uses a clean cwd,
@@ -556,10 +584,54 @@ function registerIpc() {
   if (ipcReady) return;
   ipcReady = true;
 
-  ipcMain.handle('pty:create', (_e, args) => createPty(args));
+  ipcMain.handle('pty:create', (e, args) => createPty(args, e.sender));
 
   // File → New Window: open a fresh, blank instance of the app.
   ipcMain.handle('window:new', () => { spawnNewInstance(); return true; });
+
+  // "Open in New Window" (tab context menu). The source renderer hands over the
+  // tab spec; we open a detached window in THIS process that will adopt the
+  // tab's live PTYs. We remember which window asked (sourceWcId) so, once the
+  // new window has attached, we can tell the source to serialize + release.
+  ipcMain.handle('window:detachTab', (e, payload) => {
+    const spec = { ...payload, sourceWcId: e.sender.id };
+    newDetachedWindow(spec);
+    return { ok: true };
+  });
+
+  // A booting detached window claims the tab we stashed for it (once).
+  ipcMain.handle('window:getAdoption', (e) => {
+    const p = pendingAdoption.get(e.sender.id) || null;
+    pendingAdoption.delete(e.sender.id);
+    return p;
+  });
+
+  // The detached window has built its panes and subscribed — hand ownership of
+  // each pty over to it, then ask the source window to serialize the scrollback
+  // and let go. Switching the owner FIRST makes a clean cut: everything up to
+  // now is still in the source's buffer (its serialize below), everything after
+  // now streams to the new window (which buffers it until the seed lands).
+  ipcMain.on('pty:adoptReady', (e, { ids, sourceWcId }) => {
+    for (const id of ids || []) {
+      const entry = ptys.get(id);
+      if (entry) entry.owner = e.sender;
+    }
+    const src = winByWcId(sourceWcId);
+    if (src) {
+      src.webContents.send('tab:release', { ids, toWcId: e.sender.id });
+    } else {
+      // Source window vanished mid-handoff — no seed is coming, so tell the new
+      // window to stop waiting and flush its buffered live output with no history.
+      for (const id of ids || []) e.sender.send('pane:seed', { id, data: '' });
+    }
+  });
+
+  // Forward a serialized scrollback snapshot from the source window to the
+  // adopting window, which writes it ahead of the buffered live output.
+  ipcMain.on('pty:seed', (_e, { toWcId, id, data }) => {
+    const dst = winByWcId(toWcId);
+    if (dst) dst.webContents.send('pane:seed', { id, data });
+  });
 
   // Explorer: open a dedicated File Explorer + editor window, rooted at a
   // pane's working directory, on the pane's own connection (WSL / local / ssh).
@@ -797,21 +869,24 @@ function registerIpc() {
 
   // Desktop notification when a pane needs the user. Clicking it focuses the
   // window and the specific pane; we also flash the taskbar as a fallback.
-  ipcMain.handle('notify', (_e, { id, title, body }) => {
+  ipcMain.handle('notify', (e, { id, title, body }) => {
+    // The pane lives in whichever window asked (main or a detached one); flash
+    // and, on click, focus THAT window so the notification lands on the pane.
+    const owner = BrowserWindow.fromWebContents(e.sender) || mainWindow;
     // taskbar flash works everywhere and is a good "something needs you" cue
-    if (mainWindow && !mainWindow.isFocused()) {
-      try { mainWindow.flashFrame(true); } catch (_) {}
+    if (owner && !owner.isFocused()) {
+      try { owner.flashFrame(true); } catch (_) {}
     }
 
     // Prefer Electron's native notification; it supports click-to-focus.
     if (Notification.isSupported()) {
       const n = new Notification({ title, body: body || '', silent: false, urgency: 'critical' });
       n.on('click', () => {
-        if (!mainWindow) return;
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.show();
-        mainWindow.focus();
-        send('focus-pane', { id });
+        if (!owner || owner.isDestroyed()) return;
+        if (owner.isMinimized()) owner.restore();
+        owner.show();
+        owner.focus();
+        owner.webContents.send('focus-pane', { id });
       });
       n.show();
       return 'native';
@@ -1054,13 +1129,14 @@ function createWindow() {
   });
 
   mainWindow = win;
+  appWindows.add(win);
 
   // Some Linux/WSLg taskbars ignore the constructor `icon` — set it explicitly too.
   try { win.setIcon(ICON_PATH); } catch (_) {}
 
   // stop the attention flash once the user looks at the window
   win.on('focus', () => { try { win.flashFrame(false); } catch (_) {} });
-  win.on('closed', () => { if (mainWindow === win) mainWindow = null; });
+  win.on('closed', () => { appWindows.delete(win); if (mainWindow === win) mainWindow = null; });
   // Keep the title-bar max/restore button icon in sync with the real state,
   // whether the change came from us or the compositor. We treat fullscreen as
   // "maximized"; native maximize (if the WM does it) counts too.
@@ -1070,6 +1146,48 @@ function createWindow() {
   win.on('unmaximize', () => send('win:state', { maximized: false }));
 
   registerIpc();
+  win.loadFile(path.join(__dirname, 'src', 'index.html'));
+  return win;
+}
+
+// A detached app window created by "Open in New Window" (tab context menu). It
+// runs the SAME renderer as the main window and shares this process, so the
+// handed-off tab's PTYs stay alive and simply re-route their output here (see
+// sendToPty + the adoption dance in registerIpc). `payload` is the tab spec the
+// new renderer claims on boot via window:getAdoption. Unlike createWindow it
+// neither claims `mainWindow` nor re-registers IPC (already done once).
+function newDetachedWindow(payload) {
+  const win = new BrowserWindow({
+    width: 1200,
+    height: 820,
+    backgroundColor: THEME_CHROME[savedTheme()].bg,
+    title: 'ClaudeIDE',
+    icon: ICON_PATH,
+    frame: false,
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: [`--hydra-theme=${savedTheme()}`],
+    },
+  });
+  appWindows.add(win);
+  try { win.setIcon(ICON_PATH); } catch (_) {}
+
+  // The tab waits here until the new renderer boots and calls window:getAdoption.
+  pendingAdoption.set(win.webContents.id, payload);
+
+  win.on('focus', () => { try { win.flashFrame(false); } catch (_) {} });
+  win.on('closed', () => { appWindows.delete(win); pendingAdoption.delete(win.webContents.id); });
+
+  // This window's own title-bar max/restore button, kept in sync like the others.
+  const tell = (p) => { if (!win.isDestroyed()) win.webContents.send('win:state', p); };
+  win.on('enter-full-screen', () => tell({ maximized: true }));
+  win.on('leave-full-screen', () => tell({ maximized: false }));
+  win.on('maximize', () => tell({ maximized: true }));
+  win.on('unmaximize', () => tell({ maximized: false }));
+
   win.loadFile(path.join(__dirname, 'src', 'index.html'));
   return win;
 }
