@@ -1735,7 +1735,7 @@ function viewMenuItems() {
     run: () => { if (!store.active) { newWorkspace(); return; } setPaneCount(n); },
   }));
   return [
-    { label: 'Add Page', hint: 'Ctrl+T', run: () => { if (!store.active) newWorkspace(); else createPane(); } },
+    { label: 'Add Pane', hint: 'Ctrl+T', run: () => { if (!store.active) newWorkspace(); else createPane(); } },
     { sep: true },
     { label: 'Split Layout', submenu: layout },
     { sep: true },
