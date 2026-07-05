@@ -516,7 +516,7 @@ function createPane(opts = {}) {
       <span class="pane-state-label state-dead">init</span>
       <span class="head-spacer"></span>
       <button class="pane-btn explorer" title="Open File Explorer for this folder (F4)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
-      <button class="pane-btn paste-path" title="Smart paste from the Windows clipboard: a file/image becomes its path, otherwise text (Ctrl+Shift+V)">ℹ</button>
+      <button class="pane-btn paste-path" title="Smart paste from the Windows clipboard: a file/image becomes its path, otherwise text (Ctrl+V)">ℹ</button>
       <button class="pane-btn restart" title="Restart command">↻</button>
       <button class="pane-btn close" title="Close pane">✕</button>
     </div>
@@ -696,7 +696,7 @@ function createPane(opts = {}) {
   el.querySelector('.paste-path').addEventListener('click', (e) => {
     e.stopPropagation();
     focusPane(p);
-    smartPaste(p);   // same behaviour as Ctrl+Shift+V: path for a file/image, else text
+    smartPaste(p);   // same behaviour as Ctrl+V: path for a file/image, else text
   });
   el.querySelector('.explorer').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1661,7 +1661,7 @@ function editMenuItems() {
   const hasSel = hasPane && !!p.term.getSelection();
   return [
     { label: 'Copy',       hint: 'Ctrl+Shift+C', disabled: !hasSel,  run: () => copySelection() },
-    { label: 'Paste',      hint: 'Ctrl+Shift+V', disabled: !hasPane, run: () => smartPaste() },
+    { label: 'Paste',      hint: 'Ctrl+V', disabled: !hasPane, run: () => smartPaste() },
     { label: 'Select All', disabled: !hasPane, run: () => { const q = panes.get(focusedId); if (q && q.term) { q.term.selectAll(); focusPane(q); } } },
     { sep: true },
     { label: 'Clear Terminal', disabled: !hasPane, run: () => { const q = panes.get(focusedId); if (q && q.term) { q.term.clear(); flash('Terminal cleared'); } } },
@@ -1725,6 +1725,7 @@ function showSettingsMenu(anchor) {
 // Release history, newest first — surfaced in the About dialog so users can see
 // what shipped when. Keep this in step with the "Release vX" commits.
 const RELEASES = [
+  ['0.5.17', 'Smart paste moves to plain Ctrl+V (Ctrl+Shift+V still works)'],
   ['0.5.16', 'SSH connections can pick their client: WSL ssh or PowerShell ssh'],
   ['0.5.15', 'File/Edit/View/Help menu bar + About dialog + Settings under File'],
   ['0.5.14', 'Smart paste text fallback + reliable Windows clipboard bridge'],
@@ -2927,11 +2928,19 @@ function handleShortcut(e) {
   // browser's native Ctrl+C can't grab the selection; we read it explicitly. Plain
   // Ctrl+C is left untouched so it still sends SIGINT to the program.
   if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) { copySelection(); return true; }
-  // Ctrl+Shift+V — smart paste. If the Windows clipboard holds a file/image, insert
-  // its path (the WSLg bridge, since neither drag-from-Explorer nor a normal paste
-  // can deliver a Windows file); otherwise paste the clipboard's plain text. This
-  // makes it the symmetric counterpart to Ctrl+Shift+C.
-  if (e.ctrlKey && e.shiftKey && (e.key === 'V' || e.key === 'v')) { smartPaste(); return true; }
+  // Ctrl+V (and Ctrl+Shift+V) — smart paste. If the Windows clipboard holds a
+  // file/image, insert its path (the WSLg bridge, since neither drag-from-Explorer
+  // nor a normal paste can deliver a Windows file); otherwise paste the clipboard's
+  // plain text. Plain Ctrl+V only fires this in the terminal — inside a real text
+  // field (rename title, dialogs) it must stay the browser's native paste. The
+  // check treats xterm's hidden helper textarea as terminal, not text field.
+  if (e.ctrlKey && !e.altKey && (e.key === 'V' || e.key === 'v')) {
+    const t = e.target;
+    const inTextField = t && (t.isContentEditable ||
+      ((t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') &&
+       !t.classList.contains('xterm-helper-textarea')));
+    if (e.shiftKey || !inTextField) { smartPaste(); return true; }
+  }
   if (e.ctrlKey && !e.shiftKey && (e.key === 'T' || e.key === 't')) {
     if (store.active) createPane(); else newWorkspace();
     return true;
