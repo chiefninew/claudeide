@@ -843,9 +843,22 @@ async function spawnPty(p) {
 // so the remote session just starts in its own home.
 function runCommand(p) {
   if (p.exited) return;
-  const isSsh = (p.target && p.target.kind) === 'ssh';
-  const cd = (!isSsh && p.cwd) ? `cd ${shellQuote(p.cwd)} && ` : '';
-  const line = cd + (p.command || '');
+  const kind = (p.target && p.target.kind) || 'wsl';
+  const isSsh = kind === 'ssh';
+  // A local pane on native Windows runs Windows PowerShell, which rejects '&&'
+  // as a statement separator (only PS 7+ accepts it) and quotes strings by
+  // doubling single quotes rather than POSIX backslash-escaping. Use ';' with
+  // an '$?' guard so `claude` still only runs when the `cd` succeeded.
+  const isPwsh = kind === 'local' && env.isWin;
+  let line;
+  if (isSsh || !p.cwd) {
+    line = p.command || '';
+  } else if (isPwsh) {
+    const cd = `cd ${pwshQuote(p.cwd)}`;
+    line = p.command ? `${cd}; if ($?) { ${p.command} }` : cd;
+  } else {
+    line = `cd ${shellQuote(p.cwd)} && ${p.command || ''}`;
+  }
   if (line.trim()) window.hydra.input(p.id, line + '\r');
 }
 
@@ -880,6 +893,7 @@ function renderGitStatus() {
 }
 
 function shellQuote(s) { return `'${s.replace(/'/g, `'\\''`)}'`; }
+function pwshQuote(s) { return `'${s.replace(/'/g, "''")}'`; }
 function cmdValue() { return document.getElementById('cmd').value.trim(); }
 function cwdInput() { return document.getElementById('cwd').value.trim(); }
 
@@ -1721,7 +1735,7 @@ function editMenuItems() {
   const hasPane = !!(p && p.term);
   const hasSel = hasPane && !!p.term.getSelection();
   return [
-    { label: 'Copy',       hint: 'Ctrl+Shift+C', disabled: !hasSel,  run: () => copySelection() },
+    { label: 'Copy',       hint: 'Ctrl+C', disabled: !hasSel,  run: () => copySelection() },
     { label: 'Paste',      hint: 'Ctrl+V', disabled: !hasPane, run: () => smartPaste() },
     { label: 'Select All', disabled: !hasPane, run: () => { const q = panes.get(focusedId); if (q && q.term) { q.term.selectAll(); focusPane(q); } } },
     { sep: true },
@@ -3051,6 +3065,19 @@ function handleShortcut(e) {
   // browser's native Ctrl+C can't grab the selection; we read it explicitly. Plain
   // Ctrl+C is left untouched so it still sends SIGINT to the program.
   if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) { copySelection(); return true; }
+  // Plain Ctrl+C — VSCode/Windows-Terminal-style smart copy. If text is selected,
+  // copy it and clear the selection (so a second Ctrl+C falls through). With
+  // nothing selected, return falsy so xterm delivers it to the PTY as SIGINT —
+  // the terminal interrupt — exactly as before.
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'C' || e.key === 'c')) {
+    const p = panes.get(focusedId);
+    if (p && p.term && p.term.hasSelection()) {
+      copySelection(p);
+      p.term.clearSelection();
+      return true;
+    }
+    return false;   // no selection → let it reach the shell as SIGINT
+  }
   // Ctrl+V (and Ctrl+Shift+V) — smart paste. If the Windows clipboard holds a
   // file/image, insert its path (the WSLg bridge, since neither drag-from-Explorer
   // nor a normal paste can deliver a Windows file); otherwise paste the clipboard's
