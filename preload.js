@@ -56,11 +56,15 @@ contextBridge.exposeInMainWorld('hydra', {
   minimize: () => ipcRenderer.send('win:minimize'),
   toggleMaximize: () => ipcRenderer.send('win:toggle-maximize'),
   closeWindow: () => ipcRenderer.send('win:close'),
-  // Manual title-bar dragging (WSLg swallows mouse events on -webkit-app-region
-  // drag regions, so we move the window ourselves from screen-coord deltas).
+  // Title-bar dragging (WSLg swallows mouse events on -webkit-app-region drag
+  // regions, so the renderer drives it). dragNative asks the WM to take over
+  // the move (smooth, OS-driven); the start/move/end trio is the manual fallback.
   dragStart: (x, y) => ipcRenderer.send('win:drag-start', { x, y }),
+  dragNative: () => ipcRenderer.invoke('win:drag-native'),
   dragMove: (x, y) => ipcRenderer.send('win:drag-move', { x, y }),
   dragEnd: () => ipcRenderer.send('win:drag-end'),
+  // The WM took over mid-drag (maximized-window tear-off) — drop local drag state.
+  onDragTookOver: (cb) => ipcRenderer.on('win:drag-took-over', () => cb()),
   onWindowState: (cb) => {
     const fn = (_e, payload) => cb(payload);
     ipcRenderer.on('win:state', fn);

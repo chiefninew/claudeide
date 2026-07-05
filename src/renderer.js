@@ -148,6 +148,54 @@ const TERM_KEYS = [
   ['brightBlue', 'Bright Blue'], ['brightMagenta', 'Bright Magenta'], ['brightCyan', 'Bright Cyan'], ['brightWhite', 'Bright White'],
 ];
 
+// ---- typography ------------------------------------------------------------
+// Fonts are a global preference (store.fonts) layered on top of whichever theme
+// is active. UI fonts paint the chrome via the --ui-font-* CSS variables (all
+// chrome font sizes in styles.css derive from --ui-font-size); terminal fonts
+// feed xterm options on every live pane. Edited in the Theme Studio.
+const DEFAULT_FONTS = {
+  ui:   { family: '"Segoe UI", -apple-system, Ubuntu, "Droid Sans", sans-serif', size: 14, weight: 400 },
+  term: { family: 'Consolas, "Courier New", Menlo, Monaco, "Droid Sans Mono", monospace', size: 14, weight: 400 },
+};
+const FONT_WEIGHTS = [300, 400, 500, 600, 700];
+
+function normalizeFonts(f) {
+  const part = (p, d) => ({
+    family: p && typeof p.family === 'string' && p.family.trim() ? p.family.trim() : d.family,
+    size: Math.min(32, Math.max(8, parseInt(p && p.size, 10) || d.size)),
+    weight: FONT_WEIGHTS.includes(parseInt(p && p.weight, 10)) ? parseInt(p.weight, 10) : d.weight,
+  });
+  return { ui: part(f && f.ui, DEFAULT_FONTS.ui), term: part(f && f.term, DEFAULT_FONTS.term) };
+}
+
+function currentFonts() { return normalizeFonts(store && store.fonts); }
+
+// xterm constructor/options slice for the terminal font preference.
+function termFontOptions(fonts) {
+  const t = (fonts || currentFonts()).term;
+  return { fontFamily: t.family, fontSize: t.size, fontWeight: t.weight };
+}
+
+// Apply fonts: restyle the chrome (CSS vars), re-font every live terminal (and
+// refit, since cell metrics change), and optionally persist the preference.
+function applyFonts(fonts, { persist = true } = {}) {
+  const f = normalizeFonts(fonts);
+  const s = document.documentElement.style;
+  s.setProperty('--ui-font-family', f.ui.family);
+  s.setProperty('--ui-font-size', `${f.ui.size}px`);
+  s.setProperty('--ui-font-weight', String(f.ui.weight));
+  for (const p of panes.values()) {
+    try {
+      p.term.options.fontFamily = f.term.family;
+      p.term.options.fontSize = f.term.size;
+      p.term.options.fontWeight = f.term.weight;
+      fitPane(p);
+    } catch (_) { /* not yet attached */ }
+  }
+  if (persist && store) { store.fonts = f; scheduleSave(); }
+  return f;
+}
+
 // Snapshot the currently-applied theme (resolved chrome vars + terminal palette)
 // into an editable model. Works from any base theme since it reads computed CSS.
 function snapshotThemeModel() {
@@ -365,16 +413,32 @@ function rebuildPaneOrder() {
   panes = next;
 }
 
+function gcd(a, b) { return b ? gcd(b, a % b) : a; }
+
+// Lay out one group's visible panes row-major with no vacant cells: full rows
+// split the width into `cols` equal panes, and the final partial row's panes
+// widen to share the whole row (VSCode-style fluid grid). The track count is
+// lcm(cols, remainder) so both row shapes divide it evenly — e.g. 5 panes in a
+// 3-wide grid become 6 tracks: three span-2 panes on top, two span-3 below.
+function applyGridShape(gridEl) {
+  const vis = [...gridEl.children].filter((el) => !el.classList.contains('hidden'));
+  const n = vis.length;
+  const cols = layoutColumns(n);
+  const rows = Math.ceil(n / cols) || 1;
+  const rem = n % cols;                                   // panes on a partial last row
+  const tracks = rem ? (cols * rem) / gcd(cols, rem) : cols;
+  gridEl.style.gridTemplateColumns = `repeat(${tracks}, minmax(0, 1fr))`;
+  gridEl.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+  vis.forEach((el, i) => {
+    el.style.gridColumn = `span ${rem && i >= n - rem ? tracks / rem : tracks / cols}`;
+  });
+}
+
 // Lay out each group's grid for its active tab's pane count.
 function relayout() {
   for (const g of (store.groups || [])) {
     const gridEl = groupGridEl(g.id);
-    if (!gridEl) continue;
-    const n = g.active ? panesOf(g.active).length : 0;
-    const cols = layoutColumns(n);
-    const rows = Math.ceil(n / cols) || 1;
-    gridEl.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
-    gridEl.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+    if (gridEl) applyGridShape(gridEl);
   }
   // fit terminals after the DOM settles
   requestAnimationFrame(() => {
@@ -536,10 +600,7 @@ function createPane(opts = {}) {
 
   const term = new Terminal({
     theme: xtermTheme(themeId),
-    // Match VSCode's default terminal font per platform: Consolas (Windows),
-    // Menlo (macOS), Droid Sans Mono (Linux), with a generic fallback.
-    fontFamily: 'Consolas, "Courier New", Menlo, Monaco, "Droid Sans Mono", monospace',
-    fontSize: 14,            // VSCode's default terminal/editor font size
+    ...termFontOptions(),    // user's terminal font (family/size/weight)
     cursorBlink: true,
     scrollback: 5000,
     // Wheel feel. xterm's default of 1 line/notch crawls; 5 matches VSCode's
@@ -731,7 +792,7 @@ function createPane(opts = {}) {
     el.classList.remove('dragging');
     draggingEl = null;
     rebuildPaneOrder();   // sync the Map (persistence) to the new DOM order
-    for (const q of panes.values()) fitPane(q);
+    relayout();           // reassign row-position-dependent spans, then refit
     scheduleSave();
   });
   // Double-click the title bar (like maximizing a window) toggles focus mode.
@@ -995,7 +1056,7 @@ function normalizeStore(s) {
     }
     s.groups = s.groups.filter((g) => g.open.length);
     s.recents = s.recents || {};
-    if (!s.groups.length) return { ...freshStore(), recents: s.recents, theme: s.theme, zoom: s.zoom, customTheme: s.customTheme };
+    if (!s.groups.length) return { ...freshStore(), recents: s.recents, theme: s.theme, zoom: s.zoom, customTheme: s.customTheme, fonts: s.fonts };
     for (const g of s.groups) {
       if (!g.open.includes(g.active)) g.active = g.open[0];
       if (!g.flex) g.flex = 1;
@@ -1025,7 +1086,7 @@ function normalizeToV4(s) {
     s.open = s.open.filter((id) => s.tabs[id]);
     // No open tabs → welcome screen, but KEEP the saved-workspace registry and
     // prefs (so closing the last tab, or a blank New Window, still lists them).
-    if (!s.open.length) return { ...freshStore(), recents: s.recents || {}, theme: s.theme, zoom: s.zoom, customTheme: s.customTheme };
+    if (!s.open.length) return { ...freshStore(), recents: s.recents || {}, theme: s.theme, zoom: s.zoom, customTheme: s.customTheme, fonts: s.fonts };
     if (!s.tabs[s.active]) s.active = s.open[0];
     s.recents = s.recents || {};
     for (const id of s.open) {                               // open tabs are always reopenable
@@ -1643,7 +1704,7 @@ function fileMenuItems() {
     { label: 'Edit Workspace…', run: () => editWorkspace() },
     { sep: true },
     { label: 'Settings…', run: () => showSettingsMenu(anchor) },
-    { label: 'Color Theme…', run: () => showThemeMenu(anchor) },
+    { label: 'Theme…', run: () => showThemeMenu(anchor) },
     { sep: true },
     { label: 'Zoom In',    hint: 'Ctrl +',  keepOpen: true, run: () => window.hydra.zoom('in') },
     { label: 'Zoom Out',   hint: 'Ctrl -',  keepOpen: true, run: () => window.hydra.zoom('out') },
@@ -1725,6 +1786,8 @@ function showSettingsMenu(anchor) {
 // Release history, newest first — surfaced in the About dialog so users can see
 // what shipped when. Keep this in step with the "Release vX" commits.
 const RELEASES = [
+  ['0.5.19', 'Fluid pane grid: a partial last row widens its panes — no more vacant cells'],
+  ['0.5.18', 'Drag a maximized window to tear it off at half size; drop at a monitor\'s top edge to re-maximize'],
   ['0.5.17', 'Smart paste moves to plain Ctrl+V (Ctrl+Shift+V still works)'],
   ['0.5.16', 'SSH connections can pick their client: WSL ssh or PowerShell ssh'],
   ['0.5.15', 'File/Edit/View/Help menu bar + About dialog + Settings under File'],
@@ -1877,17 +1940,22 @@ function showThemeMenu(anchor) {
 }
 
 // ---- Theme Studio ----------------------------------------------------------
-// A full-palette editor: forks the applied theme, lets you tweak every chrome
-// variable and terminal color with live preview, then saves as the 'custom'
-// theme. Import/Export move the theme in/out as JSON (via the clipboard).
+// A full theme editor: forks the applied theme, lets you tweak typography (UI +
+// terminal font family/size/weight), every chrome variable, and every terminal
+// color with live preview. Colors save as the 'custom' theme; fonts are a global
+// preference that rides along with any theme. Import/Export move the whole thing
+// in/out as JSON (via the clipboard).
 function openThemeStudio() {
   // Fork whatever is applied right now: the saved custom theme, or a snapshot of
   // the current built-in. deep-copied so edits don't mutate the live store.
   const base = (themeId === 'custom' && store && store.customTheme)
     ? { vars: { ...store.customTheme.vars }, term: { ...store.customTheme.term } }
     : snapshotThemeModel();
-  const model = { name: 'Custom', vars: { ...base.vars }, term: { ...base.term } };
+  const baseFonts = currentFonts();
+  const model = { name: 'Custom', vars: { ...base.vars }, term: { ...base.term },
+    fonts: { ui: { ...baseFonts.ui }, term: { ...baseFonts.term } } };
   const initial = JSON.stringify(model);                 // for Reset
+  const initialColors = JSON.stringify({ vars: model.vars, term: model.term });
   const committed = (store && store.theme) || 'dark';    // for Cancel/Escape revert
 
   const overlay = document.createElement('div');
@@ -1901,7 +1969,7 @@ function openThemeStudio() {
           <button class="ts-tool" data-act="export">Export</button>
         </span>
       </div>
-      <div class="ts-hint">Edit any color — changes preview live. Save to keep it as your Custom theme.</div>
+      <div class="ts-hint">Edit fonts and colors — changes preview live. Color edits save as your Custom theme; fonts apply to every theme.</div>
       <div class="ts-body"></div>
       <div class="modal-actions">
         <button class="ts-reset ws-back">Reset</button>
@@ -1914,6 +1982,7 @@ function openThemeStudio() {
   // Live-preview the in-progress model onto the running app.
   const preview = () => {
     applyInlineThemeVars(model);
+    applyFonts(model.fonts, { persist: false });
     for (const p of panes.values()) { try { p.term.options.theme = { ...model.term }; } catch (_) { /* not attached */ } }
   };
 
@@ -1946,6 +2015,49 @@ function openThemeStudio() {
     body.appendChild(sec);
   };
 
+  // Typography — one row per surface: family (free text), size (px), weight.
+  const addFontRow = (parent, label, part) => {
+    const row = document.createElement('div');
+    row.className = 'ts-row';
+    row.innerHTML =
+      `<span class="ts-name"></span>`
+      + `<span class="ts-controls">`
+      +   `<input type="text" class="ts-family modal-input" spellcheck="false" title="Font family">`
+      +   `<input type="number" class="ts-size modal-input" min="8" max="32" step="1" title="Font size (px)">`
+      +   `<select class="ts-weight" title="Font weight"></select>`
+      + `</span>`;
+    row.querySelector('.ts-name').textContent = label;
+    const family = row.querySelector('.ts-family');
+    const size = row.querySelector('.ts-size');
+    const weight = row.querySelector('.ts-weight');
+    const weightNames = { 300: 'Light 300', 400: 'Regular 400', 500: 'Medium 500', 600: 'Semibold 600', 700: 'Bold 700' };
+    for (const w of FONT_WEIGHTS) {
+      const o = document.createElement('option');
+      o.value = String(w); o.textContent = weightNames[w];
+      weight.appendChild(o);
+    }
+    const resync = () => {
+      const f = model.fonts[part];
+      family.value = f.family; size.value = f.size; weight.value = String(f.weight);
+    };
+    resync();
+    family.addEventListener('input', () => { model.fonts[part].family = family.value; preview(); });
+    size.addEventListener('input', () => {
+      const n = parseInt(size.value, 10);
+      if (n >= 8 && n <= 32) { model.fonts[part].size = n; preview(); }
+    });
+    weight.addEventListener('change', () => { model.fonts[part].weight = parseInt(weight.value, 10); preview(); });
+    resyncers.push(resync);
+    parent.appendChild(row);
+  };
+  {
+    const sec = document.createElement('div'); sec.className = 'ts-group ts-fonts';
+    const h = document.createElement('div'); h.className = 'ts-group-title'; h.textContent = 'Typography'; sec.appendChild(h);
+    addFontRow(sec, 'Interface', 'ui');
+    addFontRow(sec, 'Terminal', 'term');
+    body.appendChild(sec);
+  }
+
   for (const g of THEME_VAR_GROUPS) addGroup(g.title, g.vars, (k) => model.vars[k], (k, v) => { model.vars[k] = v; });
   addGroup('Terminal', TERM_KEYS, (k) => model.term[k], (k, v) => { model.term[k] = v; });
   preview();
@@ -1953,7 +2065,10 @@ function openThemeStudio() {
   const close = (revert) => {
     overlay.remove();
     document.removeEventListener('keydown', onKey, true);
-    if (revert) applyTheme(committed, { persist: false });   // undo the live preview
+    if (revert) {                                            // undo the live preview
+      applyTheme(committed, { persist: false });
+      applyFonts(baseFonts, { persist: false });
+    }
   };
   const onKey = (e) => {
     // Ignore keys destined for a modal opened on top of us (e.g. the Import dialog).
@@ -1969,21 +2084,31 @@ function openThemeStudio() {
   overlay.querySelector('.ts-reset').onclick = () => {
     const f = JSON.parse(initial);
     model.vars = { ...f.vars }; model.term = { ...f.term };
+    model.fonts = { ui: { ...f.fonts.ui }, term: { ...f.fonts.term } };
     for (const r of resyncers) r();
     preview();
   };
 
   overlay.querySelector('.ts-save').onclick = () => {
-    store.customTheme = { name: 'Custom', vars: { ...model.vars }, term: { ...model.term } };
-    XTERM_THEMES.custom = { ...model.term };
-    scheduleSave();
-    close(false);
-    applyTheme('custom');       // commit + persist store.theme = 'custom'
+    applyFonts(model.fonts);    // fonts are global — persist regardless of theme
+    // Colors only fork into the Custom theme when actually edited, so a
+    // fonts-only tweak doesn't silently move you off a built-in theme.
+    const colorsChanged = JSON.stringify({ vars: model.vars, term: model.term }) !== initialColors;
+    if (colorsChanged || themeId === 'custom') {
+      store.customTheme = { name: 'Custom', vars: { ...model.vars }, term: { ...model.term } };
+      XTERM_THEMES.custom = { ...model.term };
+      scheduleSave();
+      close(false);
+      applyTheme('custom');     // commit + persist store.theme = 'custom'
+    } else {
+      close(false);
+      applyTheme(committed, { persist: false });   // clear the preview's inline vars
+    }
     flash('Theme saved');
   };
 
   overlay.querySelector('[data-act="export"]').onclick = () => {
-    const json = JSON.stringify({ claudeIdeTheme: 1, name: 'Custom', vars: model.vars, term: model.term }, null, 2);
+    const json = JSON.stringify({ claudeIdeTheme: 1, name: 'Custom', vars: model.vars, term: model.term, fonts: model.fonts }, null, 2);
     writeClipboardText(json).then(() => flash('Theme JSON copied')).catch(() => flash('Could not copy'));
   };
   overlay.querySelector('[data-act="import"]').onclick = async () => {
@@ -1994,6 +2119,7 @@ function openThemeStudio() {
     if (!parsed || !parsed.vars || !parsed.term) { flash('Not a theme'); return; }
     for (const v of THEME_VARS) if (parsed.vars[v]) model.vars[v] = String(parsed.vars[v]);
     for (const [k] of TERM_KEYS) if (parsed.term[k]) model.term[k] = String(parsed.term[k]);
+    if (parsed.fonts) model.fonts = normalizeFonts(parsed.fonts);
     for (const r of resyncers) r();
     preview();
     flash('Theme imported — review and Save');
@@ -2858,10 +2984,7 @@ function createFrontMirror(paneId) {
 
   const term = new Terminal({
     theme: xtermTheme(themeId),
-    // Match VSCode's default terminal font per platform: Consolas (Windows),
-    // Menlo (macOS), Droid Sans Mono (Linux), with a generic fallback.
-    fontFamily: 'Consolas, "Courier New", Menlo, Monaco, "Droid Sans Mono", monospace',
-    fontSize: 14, cursorBlink: true, scrollback: 5000,
+    ...termFontOptions(), cursorBlink: true, scrollback: 5000,
     scrollSensitivity: 5, fastScrollSensitivity: 5, allowProposedApi: true,
   });
   const fit = new FitAddon.FitAddon();
@@ -3307,12 +3430,14 @@ document.getElementById('win-max').addEventListener('click', () => window.hydra.
 document.getElementById('win-close').addEventListener('click', () => window.hydra.closeWindow());
 // Manual title-bar behavior: drag to move, double-click to maximize. We can't
 // use CSS `-webkit-app-region: drag` because WSLg swallows mouse events on drag
-// regions (so double-click never fires). We detect both here and drive the
-// window over IPC. Interactive children (buttons/inputs/menu) are excluded.
+// regions (so double-click never fires). We detect both here; once real movement
+// starts, main tries to hand the drag to the window manager (native, smooth) and
+// only falls back to streaming coords over IPC if that's unavailable.
 (function setupTitlebarDrag() {
   const bar = document.getElementById('toolbar');
   const INTERACTIVE = 'button, input, select, label, .window-controls, .menu-btn';
-  let dragging = false;
+  let armed = null;     // mousedown position; the drag starts after a movement threshold
+  let dragging = false; // manual (streamed) drag in progress
   let pending = null;   // latest cursor position awaiting a frame
   let rafId = 0;
 
@@ -3324,12 +3449,16 @@ document.getElementById('win-close').addEventListener('click', () => window.hydr
     rafId = 0;
     if (dragging && pending) { window.hydra.dragMove(pending.x, pending.y); pending = null; }
   };
-  const endDrag = () => {
-    if (!dragging) return;
+  const cleanup = () => {
+    armed = null;
     dragging = false;
     document.body.classList.remove('win-dragging');
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
     pending = null;
+  };
+  const endDrag = () => {
+    if (!dragging) { armed = null; return; }
+    cleanup();
     window.hydra.dragEnd();
   };
 
@@ -3340,14 +3469,23 @@ document.getElementById('win-close').addEventListener('click', () => window.hydr
       window.hydra.toggleMaximize();
       return;
     }
-    dragging = true;
-    // Freeze the toolbar's zen-collapse transition so any layout jitter WSLg
-    // fires while the window moves can't animate the header expanding.
-    document.body.classList.add('win-dragging');
-    window.hydra.dragStart(e.screenX, e.screenY);
+    // Arm only — the drag starts on real movement, so plain clicks and
+    // double-clicks never hand the pointer grab to the window manager.
+    armed = { x: e.screenX, y: e.screenY };
     e.preventDefault();                  // don't start a text selection
   });
   window.addEventListener('mousemove', (e) => {
+    if (armed && !dragging) {
+      if (Math.abs(e.screenX - armed.x) + Math.abs(e.screenY - armed.y) < 4) return;
+      dragging = true;
+      // Freeze the toolbar's zen-collapse transition so any layout jitter WSLg
+      // fires while the window moves can't animate the header expanding.
+      document.body.classList.add('win-dragging');
+      window.hydra.dragStart(armed.x, armed.y);
+      // Prefer the native WM move: if it takes over, no more mouse events reach
+      // us until release, so just drop local state. Otherwise keep streaming.
+      window.hydra.dragNative().then((native) => { if (native) cleanup(); });
+    }
     if (!dragging) return;
     pending = { x: e.screenX, y: e.screenY };
     if (!rafId) rafId = requestAnimationFrame(flush);
@@ -3355,6 +3493,8 @@ document.getElementById('win-close').addEventListener('click', () => window.hydr
   window.addEventListener('mouseup', endDrag);
   // If the cursor leaves the window or focus is lost mid-drag, stop cleanly.
   window.addEventListener('blur', endDrag);
+  // A maximized-window tear-off finished restoring and the WM took the drag over.
+  window.hydra.onDragTookOver(cleanup);
 })();
 // reflect the real maximize state on the button (restore vs maximize icon)
 window.hydra.onWindowState(({ maximized }) => {
@@ -3404,6 +3544,7 @@ editor.addEventListener('dragover', (e) => {
   const r = target.getBoundingClientRect();
   const before = e.clientX < r.left + r.width / 2;
   homeGrid.insertBefore(draggingEl, before ? target : target.nextSibling);
+  applyGridShape(homeGrid);   // pane widths depend on row position — keep them true mid-drag
 });
 editor.addEventListener('drop', (e) => { if (draggingEl) e.preventDefault(); });
 
@@ -3443,6 +3584,10 @@ window.addEventListener('beforeunload', () => { clearTimeout(saveTimer); saveSta
   // with the right palette and the chrome paints correctly from the first frame.
   store.theme = XTERM_THEMES[store.theme] ? store.theme : 'dark';
   applyTheme(store.theme, { persist: false });
+
+  // Same for fonts: paint the chrome vars now; terminals pick the font up at
+  // construction (termFontOptions reads the store). No-op on the defaults.
+  if (store.fonts) applyFonts(store.fonts, { persist: false });
 
   // Restore the saved text-zoom level (no-op at 0). Triggers a zoom:changed that
   // refits terminals once they exist; suppress its toast (it's not a user action).

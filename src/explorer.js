@@ -368,23 +368,31 @@ hydra.onWindowState(({ maximized }) => {
 (function setupTitlebarDrag() {
   const bar = document.getElementById('xp-titlebar');
   const INTERACTIVE = 'button, .window-controls';
-  let dragging = false, pending = null, rafId = 0;
+  let armed = null, dragging = false, pending = null, rafId = 0;
   const flush = () => { rafId = 0; if (dragging && pending) { hydra.dragMove(pending.x, pending.y); pending = null; } };
-  const endDrag = () => { if (!dragging) return; dragging = false; if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } pending = null; hydra.dragEnd(); };
+  const cleanup = () => { armed = null; dragging = false; if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } pending = null; };
+  const endDrag = () => { if (!dragging) { armed = null; return; } cleanup(); hydra.dragEnd(); };
   bar.addEventListener('mousedown', (e) => {
     if (e.button !== 0 || e.target.closest(INTERACTIVE)) return;
     if (e.detail >= 2) { endDrag(); hydra.toggleMaximize(); return; }
-    dragging = true;
-    hydra.dragStart(e.screenX, e.screenY);
+    armed = { x: e.screenX, y: e.screenY };  // drag starts on real movement (keeps double-click intact)
     e.preventDefault();
   });
   window.addEventListener('mousemove', (e) => {
+    if (armed && !dragging) {
+      if (Math.abs(e.screenX - armed.x) + Math.abs(e.screenY - armed.y) < 4) return;
+      dragging = true;
+      hydra.dragStart(armed.x, armed.y);
+      // Native WM move when available (smooth); manual streaming as fallback.
+      hydra.dragNative().then((native) => { if (native) cleanup(); });
+    }
     if (!dragging) return;
     pending = { x: e.screenX, y: e.screenY };
     if (!rafId) rafId = requestAnimationFrame(flush);
   });
   window.addEventListener('mouseup', endDrag);
   window.addEventListener('blur', endDrag);
+  hydra.onDragTookOver(cleanup);
 })();
 
 // ---- sash: drag to resize the sidebar --------------------------------------

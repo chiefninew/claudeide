@@ -1,7 +1,7 @@
 {
   "name": "claudeide",
   "productName": "ClaudeIDE",
-  "version": "0.5.17",
+  "version": "0.5.19",
   "description": "A terminal-grid editor for running many Claude Code CLI sessions at once.",
   "main": "main.js",
   "scripts": {
@@ -54,6 +54,7 @@
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/xterm": "^5.5.0",
-    "node-pty": "^1.0.0"
+    "node-pty": "^1.0.0",
+    "x11": "^2.3.0"
   }
 }
