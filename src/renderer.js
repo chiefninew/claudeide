@@ -3391,6 +3391,11 @@ document.getElementById('welcome-new').addEventListener('click', () => newWorksp
 document.getElementById('welcome-open').addEventListener('click', (e) =>
   showWorkspaceMenu(e.currentTarget));
 
+// Header + Add Terminal button — mirrors View ▸ Add Pane (Ctrl+T).
+document.getElementById('add-terminal').addEventListener('click', () => {
+  if (!store.active) newWorkspace(); else createPane();
+});
+
 function setPaneCount(target) {
   // operates on the ACTIVE workspace only
   while (panesOf(store.active).length < target) createPane();
@@ -3482,9 +3487,10 @@ document.getElementById('win-close').addEventListener('click', () => window.hydr
       // fires while the window moves can't animate the header expanding.
       document.body.classList.add('win-dragging');
       window.hydra.dragStart(armed.x, armed.y);
-      // Prefer the native WM move: if it takes over, no more mouse events reach
-      // us until release, so just drop local state. Otherwise keep streaming.
-      window.hydra.dragNative().then((native) => { if (native) cleanup(); });
+      // We stream the move ourselves rather than handing off to the WM. The
+      // native _NET_WM_MOVERESIZE path lagged (it races this stream) and WSLg's
+      // RAIL bridge mis-handled the MOVE as a slow resize, so the window crept
+      // larger while held. Delta-from-origin streaming is reliable here.
     }
     if (!dragging) return;
     pending = { x: e.screenX, y: e.screenY };
@@ -3493,8 +3499,6 @@ document.getElementById('win-close').addEventListener('click', () => window.hydr
   window.addEventListener('mouseup', endDrag);
   // If the cursor leaves the window or focus is lost mid-drag, stop cleanly.
   window.addEventListener('blur', endDrag);
-  // A maximized-window tear-off finished restoring and the WM took the drag over.
-  window.hydra.onDragTookOver(cleanup);
 })();
 // reflect the real maximize state on the button (restore vs maximize icon)
 window.hydra.onWindowState(({ maximized }) => {

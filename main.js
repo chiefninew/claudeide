@@ -665,58 +665,15 @@ function registerIpc() {
   ipcMain.on('win:toggle-maximize', (e) => { const w = BrowserWindow.fromWebContents(e.sender) || mainWindow; if (w) toggleMaximize(w); });
   ipcMain.on('win:close', (e) => { const w = BrowserWindow.fromWebContents(e.sender) || mainWindow; if (w) w.close(); });
 
-  // Title-bar window dragging. Preferred path: hand the drag to the window
-  // manager via the EWMH _NET_WM_MOVERESIZE client message — under WSLg the
-  // compositor forwards it over RDP RAIL so Windows itself moves the window
-  // (same mechanism GTK header bars use there), which is perfectly smooth.
-  // Fallback path (non-X11, or the WM ignores us): the renderer streams cursor
-  // screen coords and we setPosition() by delta — laggy but universal.
+  // Title-bar window dragging. The renderer streams cursor screen coords and we
+  // setPosition() by delta from where the drag began — reliable and universal.
+  //
+  // We deliberately do NOT hand the drag to the window manager via the EWMH
+  // _NET_WM_MOVERESIZE client message. That path looked smoother in theory, but
+  // under WSLg it lagged (it raced the coord stream) and the RDP RAIL bridge
+  // mis-handled the MOVE as a slow resize, so the window crept larger while the
+  // button was held. Streaming has none of those problems.
   let dragOrigin = null;
-
-  let x11Conn;  // lazy singleton: Promise<{x11, X, root, moveResizeAtom} | null>
-  function getX11() {
-    if (!x11Conn) {
-      x11Conn = new Promise((resolve) => {
-        let x11mod;
-        try { x11mod = require('x11'); } catch (_) { return resolve(null); }
-        x11mod.createClient((err, display) => {
-          if (err) return resolve(null);
-          const X = display.client;
-          X.on('error', () => {});  // stray X errors must not crash the app
-          X.InternAtom(false, '_NET_WM_MOVERESIZE', (e2, atom) => {
-            resolve(e2 ? null : { x11: x11mod, X, root: display.screen[0].root, moveResizeAtom: atom });
-          });
-        });
-      }).catch(() => null);
-    }
-    return x11Conn;
-  }
-  getX11();  // pre-warm so the first drag can hand off natively right away
-
-  async function startNativeDrag(win) {
-    const conn = await getX11();
-    if (!conn) return false;
-    try {
-      const { x11: x11mod, X, root, moveResizeAtom } = conn;
-      const xid = win.getNativeWindowHandle().readUInt32LE(0);
-      // Anchor the move at the pointer's X11 root position — queried from the
-      // server directly so DIP scaling can't skew it.
-      const ptr = await new Promise((res, rej) => X.QueryPointer(root, (e2, p) => (e2 ? rej(e2) : res(p))));
-      X.UngrabPointer(0);  // release the implicit press grab, as EWMH requires
-      const ev = Buffer.alloc(32);
-      ev.writeUInt8(33, 0);                  // ClientMessage
-      ev.writeUInt8(32, 1);                  // format 32
-      ev.writeUInt32LE(xid, 4);
-      ev.writeUInt32LE(moveResizeAtom, 8);
-      ev.writeInt32LE(ptr.rootX, 12);
-      ev.writeInt32LE(ptr.rootY, 16);
-      ev.writeUInt32LE(8, 20);               // _NET_WM_MOVERESIZE_MOVE
-      ev.writeUInt32LE(1, 24);               // left button
-      ev.writeUInt32LE(1, 28);               // source: normal application
-      X.SendEvent(root, 0, x11mod.eventMask.SubstructureRedirect | x11mod.eventMask.SubstructureNotify, ev);
-      return true;
-    } catch (_) { return false; }
-  }
 
   // Dragging the title bar of a maximized window tears it off, Windows-style:
   // leave fullscreen, shrink to about half the monitor's work area, and re-anchor
@@ -724,7 +681,8 @@ function registerIpc() {
   // seamlessly — including onto another monitor, since the drag follows absolute
   // screen coords. Leaving fullscreen is async under WSLg, so the bounds apply on
   // 'leave-full-screen', positioned from the drag's *latest* deltas (the cursor
-  // keeps moving during the transition).
+  // keeps moving during the transition), after which the renderer's stream keeps
+  // moving the now-normal window by delta.
   function tearOff(win, x, y) {
     const wa = screen.getDisplayNearestPoint({ x, y }).workArea;
     const [minW, minH] = win.getMinimumSize();
@@ -735,39 +693,24 @@ function registerIpc() {
     const ratio = Math.min(1, Math.max(0, (x - curX) / Math.max(1, curW)));
     const winX = Math.round(x - width * ratio);
     const winY = Math.max(wa.y, y - 16);   // grab point stays on the title bar
-    dragOrigin = { cursorX: x, cursorY: y, winX, winY, lastX: x, lastY: y, moved: true };
+    // `tearing` makes win:drag-move ignore further moves until the restore lands,
+    // so the async leave-full-screen transition can't re-enter tearOff().
+    dragOrigin = { cursorX: x, cursorY: y, winX, winY, lastX: x, lastY: y, moved: true, tearing: true };
     win.once('leave-full-screen', () => setTimeout(() => {
       const o = dragOrigin;
+      if (!o || win.isDestroyed()) return;   // button released mid-transition
       win.setBounds({
-        x: o ? o.winX + (o.lastX - o.cursorX) : winX,
-        y: o ? o.winY + (o.lastY - o.cursorY) : winY,
+        x: o.winX + (o.lastX - o.cursorX),
+        y: o.winY + (o.lastY - o.cursorY),
         width, height,
       });
-      // Now that the window is a normal one, hand the rest of the drag to the
-      // WM for smooth native movement. Guard on dragOrigin: if the button was
-      // already released we must not start a move that would stick to the cursor.
-      if (dragOrigin && !win.isDestroyed()) {
-        startNativeDrag(win).then((ok) => {
-          if (ok && dragOrigin) {
-            dragOrigin = null;
-            win.webContents.send('win:drag-took-over');
-          }
-        });
-      }
+      // Re-anchor the stream to the restored window at the cursor's latest spot
+      // so the manual move continues without a jump.
+      const [nx, ny] = win.getPosition();
+      dragOrigin = { cursorX: o.lastX, cursorY: o.lastY, winX: nx, winY: ny, lastX: o.lastX, lastY: o.lastY, moved: true };
     }, 0));
     win.setFullScreen(false);
   }
-
-  // Renderer asks (once its drag threshold is crossed) to hand the drag to the
-  // WM. Returns true when the WM took over — the renderer then stops streaming
-  // moves and will get no more mouse events until the button is released.
-  // Fullscreen windows stay on the manual path so tearOff() can run first.
-  ipcMain.handle('win:drag-native', async (e) => {
-    const win = BrowserWindow.fromWebContents(e.sender);
-    if (!win || win.isFullScreen()) return false;
-    if (await startNativeDrag(win)) { dragOrigin = null; return true; }
-    return false;
-  });
 
   ipcMain.on('win:drag-start', (e, { x, y }) => {
     const win = BrowserWindow.fromWebContents(e.sender);
@@ -779,6 +722,9 @@ function registerIpc() {
     const win = BrowserWindow.fromWebContents(e.sender);
     if (!win || !dragOrigin) return;
     dragOrigin.lastX = x; dragOrigin.lastY = y;
+    // A tear-off is mid-transition — just keep tracking the cursor (lastX/lastY,
+    // set above) so the restore can re-anchor to it; don't re-enter tearOff().
+    if (dragOrigin.tearing) return;
     if (win.isFullScreen()) {
       // A few px of slack so a sloppy click on the title bar doesn't un-maximize.
       if (Math.abs(x - dragOrigin.cursorX) + Math.abs(y - dragOrigin.cursorY) < 12) return;

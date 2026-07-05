@@ -970,6 +970,21 @@ body.zen #zen-exit { display: inline-flex; align-items: center; gap: 6px; opacit
 /* Empty, draggable stretch that keeps the window controls flush right. */
 .toolbar-spacer { flex: 1 1 auto; align-self: stretch; min-width: 0; }
 
+/* + Add Terminal — quick way to spawn a pane in the active workspace. */
+.add-terminal-btn {
+  display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
+  background: var(--btn) !important;
+  border: 1px solid transparent !important;
+  color: var(--text);
+  padding: 4px 10px !important;
+  font-size: var(--ui-font-size);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.add-terminal-btn svg { display: block; flex: 0 0 auto; }
+.add-terminal-btn:hover { background: var(--btn-hover) !important; color: var(--bright); }
+.add-terminal-btn:focus-visible { outline: 1px solid var(--focus); outline-offset: -1px; }
+
 /* ---- File ▸ Settings popover (new-pane config) ---- */
 .settings-menu { min-width: 280px; padding: 8px; }
 .settings-head { font-size: calc(var(--ui-font-size) - 2px); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 2px 6px 8px; }
