@@ -666,7 +666,9 @@ function registerIpc() {
   ipcMain.on('win:close', (e) => { const w = BrowserWindow.fromWebContents(e.sender) || mainWindow; if (w) w.close(); });
 
   // Title-bar window dragging. The renderer streams cursor screen coords and we
-  // setPosition() by delta from where the drag began — reliable and universal.
+  // setBounds() by delta from where the drag began — reliable and universal. We
+  // pin width/height (not just position) so crossing onto a different-DPI
+  // monitor can't let WSLg rescale and grow the window.
   //
   // We deliberately do NOT hand the drag to the window manager via the EWMH
   // _NET_WM_MOVERESIZE client message. That path looked smoother in theory, but
@@ -695,7 +697,7 @@ function registerIpc() {
     const winY = Math.max(wa.y, y - 16);   // grab point stays on the title bar
     // `tearing` makes win:drag-move ignore further moves until the restore lands,
     // so the async leave-full-screen transition can't re-enter tearOff().
-    dragOrigin = { cursorX: x, cursorY: y, winX, winY, lastX: x, lastY: y, moved: true, tearing: true };
+    dragOrigin = { cursorX: x, cursorY: y, winX, winY, winW: width, winH: height, lastX: x, lastY: y, moved: true, tearing: true };
     win.once('leave-full-screen', () => setTimeout(() => {
       const o = dragOrigin;
       if (!o || win.isDestroyed()) return;   // button released mid-transition
@@ -707,7 +709,7 @@ function registerIpc() {
       // Re-anchor the stream to the restored window at the cursor's latest spot
       // so the manual move continues without a jump.
       const [nx, ny] = win.getPosition();
-      dragOrigin = { cursorX: o.lastX, cursorY: o.lastY, winX: nx, winY: ny, lastX: o.lastX, lastY: o.lastY, moved: true };
+      dragOrigin = { cursorX: o.lastX, cursorY: o.lastY, winX: nx, winY: ny, winW: width, winH: height, lastX: o.lastX, lastY: o.lastY, moved: true };
     }, 0));
     win.setFullScreen(false);
   }
@@ -716,7 +718,12 @@ function registerIpc() {
     const win = BrowserWindow.fromWebContents(e.sender);
     if (!win) return;
     const [winX, winY] = win.getPosition();
-    dragOrigin = { cursorX: x, cursorY: y, winX, winY, lastX: x, lastY: y, moved: false };
+    // Capture the size too. Moving across monitors with different DPI scale
+    // factors makes WSLg/RAIL rescale the window to preserve physical size, so
+    // it creeps larger while crossing. We re-assert this size on every move via
+    // setBounds so a DPI boundary can't inflate it.
+    const [winW, winH] = win.getSize();
+    dragOrigin = { cursorX: x, cursorY: y, winX, winY, winW, winH, lastX: x, lastY: y, moved: false };
   });
   ipcMain.on('win:drag-move', (e, { x, y }) => {
     const win = BrowserWindow.fromWebContents(e.sender);
@@ -732,7 +739,14 @@ function registerIpc() {
       return;
     }
     dragOrigin.moved = true;
-    win.setPosition(dragOrigin.winX + (x - dragOrigin.cursorX), dragOrigin.winY + (y - dragOrigin.cursorY));
+    // setBounds (not setPosition) so we pin width/height too — otherwise crossing
+    // onto a different-DPI monitor lets WSLg rescale the window and it grows.
+    win.setBounds({
+      x: dragOrigin.winX + (x - dragOrigin.cursorX),
+      y: dragOrigin.winY + (y - dragOrigin.cursorY),
+      width: dragOrigin.winW,
+      height: dragOrigin.winH,
+    });
   });
   ipcMain.on('win:drag-end', (e) => {
     // Windows-style snap: releasing a drag at the very top of a monitor
